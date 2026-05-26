@@ -48,7 +48,8 @@ static constexpr uint32_t SERIAL_TIMEOUT_MS = 5000;      ///< Max wait for seria
 
 static constexpr bool ENABLE_BLINK_PWR_LED = false;          ///< Enable power LED blinking on startup
 static constexpr bool ENABLE_BOOT_COUNTER = true;          ///< Enable boot counter functionality
-static constexpr bool ENABLE_GNSS_START = true;                    ///< Enable GNSS module
+static constexpr bool ENABLE_GNSS = false;                   ///< Master switch for GNSS module (begin, ISR read, PPS, deque write)
+static constexpr bool ENABLE_GNSS_START = ENABLE_GNSS;       ///< Wait for an initial GNSS fix at boot to set the RTC
 static constexpr bool ENABLE_DEBUG_FASTPRINT = false;
 
 static constexpr bool USE_BURSTMODE = true;
@@ -211,7 +212,7 @@ extern "C" void am_ctimer_isr(void)
     }
 
     // if time to read GNSS data, do it and store in deque
-    if (ctimer_isr_count % (TIMER_DIVIDER_GNSS) == 0){
+    if (ENABLE_GNSS && ctimer_isr_count % (TIMER_DIVIDER_GNSS) == 0){
       // check if we have a new GNSS reading; if yes, push fix to deque
       if (log_GNSS.getPVT()){
         common_isr_gnss_reading.micros_reading = micros();
@@ -504,69 +505,67 @@ void setup() {
     ////////////////////////////////////////////////////
     // start and set up GNSS itself
 
-    if (!log_GNSS.begin(*I2C_QWIIC)){
-        SERIAL_USB->println(F("problem starting GNSS"));
-        
-        I2C_QWIIC->end();
-        delay(500);
-        continue;
-    }
-    SERIAL_USB->println(F("success starting GNSS"));
+    if (ENABLE_GNSS){
+      if (!log_GNSS.begin(*I2C_QWIIC)){
+          SERIAL_USB->println(F("problem starting GNSS"));
 
-    log_GNSS.setI2COutput(COM_TYPE_UBX);
-    delay(100);
-    wdt.restart();
-    SERIAL_USB->println(F("GNSS set to UBX output"));
-    delay(100);
+          I2C_QWIIC->end();
+          delay(500);
+          continue;
+      }
+      SERIAL_USB->println(F("success starting GNSS"));
 
-    // if (!gnss.setDynamicModel(DYN_MODEL_PORTABLE)){
-    //   SERIAL_USB->println(F("GNSS could not set dynamic model"));
-    //   continue;
-    // }
-    // SERIAL_USB->println(F("GNSS dynamic model set to PORTABLE"));
+      log_GNSS.setI2COutput(COM_TYPE_UBX);
+      delay(100);
+      wdt.restart();
+      SERIAL_USB->println(F("GNSS set to UBX output"));
+      delay(100);
 
-    log_GNSS.setAutoPVT(true);
-    log_GNSS.setNavigationFrequency(GNSS_FREQUENCY_HZ);
-    delay(100);
-    wdt.restart();
-    uint8_t rate = log_GNSS.getNavigationFrequency();
-    SERIAL_USB->print("Current update rate: ");
-    SERIAL_USB->println(rate);
- 
-    // wait until we get a fix
-    if (ENABLE_GNSS_START){
-      bool fix_obtained {false};
-      static constexpr unsigned long GNSS_FIX_WAIT_TIMEOUT_MS = 1000 * 60 * 2;
-      unsigned long start_wait_ms = millis();
-      SERIAL_USB->println(F("Waiting for GNSS fix..."));
-      while (millis() - start_wait_ms < GNSS_FIX_WAIT_TIMEOUT_MS){
-        if (log_GNSS.getFixType() >= 3){
-          fix_obtained = true;
-          SERIAL_USB->println(F("GNSS fix acquired."));
-          break;
+      log_GNSS.setAutoPVT(true);
+      log_GNSS.setNavigationFrequency(GNSS_FREQUENCY_HZ);
+      delay(100);
+      wdt.restart();
+      uint8_t rate = log_GNSS.getNavigationFrequency();
+      SERIAL_USB->print("Current update rate: ");
+      SERIAL_USB->println(rate);
+
+      // wait until we get a fix
+      if (ENABLE_GNSS_START){
+        bool fix_obtained {false};
+        static constexpr unsigned long GNSS_FIX_WAIT_TIMEOUT_MS = 1000 * 60 * 2;
+        unsigned long start_wait_ms = millis();
+        SERIAL_USB->println(F("Waiting for GNSS fix..."));
+        while (millis() - start_wait_ms < GNSS_FIX_WAIT_TIMEOUT_MS){
+          if (log_GNSS.getFixType() >= 3){
+            fix_obtained = true;
+            SERIAL_USB->println(F("GNSS fix acquired."));
+            break;
+          }
+          delay(500);
+          wdt.restart();
+          SERIAL_USB->print(F("."));
         }
-        delay(500);
-        wdt.restart();
-        SERIAL_USB->print(F("."));
+
+        if (!fix_obtained){
+          SERIAL_USB->println();
+          SERIAL_USB->println(F("Failed to obtain GNSS fix in time."));
+          continue;
+        }
       }
 
-      if (!fix_obtained){
-        SERIAL_USB->println();
-        SERIAL_USB->println(F("Failed to obtain GNSS fix in time."));
-        continue;
-      }
+      SERIAL_USB->println(F("GNSS setup complete."));
+      wdt.restart();
+
+      ////////////////////////////////////////////////////
+      // I would prefer a PULLDOWN but for some reason it does not work
+      // this should not matter: PULLUP should protect us anyways if floating,
+      // and the PULLUP is not harmful as it is weak enough that this gets fully driven
+      // by the GNSS PPS output
+      pinMode(PIN_LOG_PPS, INPUT_PULLUP);
+      attachInterrupt(PIN_LOG_PPS, isr_PPS, RISING);
+    } else {
+      SERIAL_USB->println(F("GNSS disabled at compile time, skipping GNSS setup."));
     }
-
-    SERIAL_USB->println(F("GNSS setup complete."));
-    wdt.restart();
-
-    ////////////////////////////////////////////////////
-    // I would prefer a PULLDOWN but for some reason it does not work
-    // this should not matter: PULLUP should protect us anyways if floating,
-    // and the PULLUP is not harmful as it is weak enough that this gets fully driven
-    // by the GNSS PPS output
-    pinMode(PIN_LOG_PPS, INPUT_PULLUP);
-    attachInterrupt(PIN_LOG_PPS, isr_PPS, RISING);
 
     ////////////////////////////////////////////////////
     // start and set up ISM330DHCX
@@ -931,13 +930,13 @@ void setup() {
           delay(2000);
           NVIC_SystemReset();
         }
-        if (!gnss_frequency_checker.check(effective_gnss_logging_rate_hz)){
+        if (ENABLE_GNSS && !gnss_frequency_checker.check(effective_gnss_logging_rate_hz)){
           SERIAL_USB->println(F("ERROR: Effective GNSS logging frequency is out of expected range!"));
           sd_card_manager.close_and_sync_file();
           delay(2000);
           NVIC_SystemReset();
         }
-        if (!pps_frequency_checker.check(effective_pps_logging_rate_hz)){
+        if (ENABLE_GNSS && !pps_frequency_checker.check(effective_pps_logging_rate_hz)){
           SERIAL_USB->println(F("ERROR: Effective PPS logging frequency is out of expected range!"));
           sd_card_manager.close_and_sync_file();
           delay(2000);
@@ -956,60 +955,62 @@ void setup() {
 
       }
 
-      // with the GNSS PPS deque
-      am_hal_interrupt_master_disable();
+      if (ENABLE_GNSS){
+        // with the GNSS PPS deque
+        am_hal_interrupt_master_disable();
 
-      working_deque_size = deque_PPS_fixes.size();
-      if (working_deque_size > 0){
-        should_log_data = true;
-        local_pps_fix = deque_PPS_fixes.front();
-        deque_PPS_fixes.pop_front();
-      }
+        working_deque_size = deque_PPS_fixes.size();
+        if (working_deque_size > 0){
+          should_log_data = true;
+          local_pps_fix = deque_PPS_fixes.front();
+          deque_PPS_fixes.pop_front();
+        }
 
-      am_hal_interrupt_master_enable();
+        am_hal_interrupt_master_enable();
 
-      if (should_log_data){
-        entry_kind[0] = '\n';
-        entry_kind[1] = 'P';
-        entry_kind[2] = 'P';
-        entry_kind[3] = 'S';
-        working_millis = millis();
-        sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(entry_kind), sizeof(entry_kind));
-        sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(&local_pps_fix), sizeof(local_pps_fix));
-        accumulated_sd_time_millis += (millis() - working_millis);
-        should_log_data = false;
-      }
+        if (should_log_data){
+          entry_kind[0] = '\n';
+          entry_kind[1] = 'P';
+          entry_kind[2] = 'P';
+          entry_kind[3] = 'S';
+          working_millis = millis();
+          sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(entry_kind), sizeof(entry_kind));
+          sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(&local_pps_fix), sizeof(local_pps_fix));
+          accumulated_sd_time_millis += (millis() - working_millis);
+          should_log_data = false;
+        }
 
-      if (working_deque_size > max_deque_size_pps){
-        max_deque_size_pps = working_deque_size;
-      }
+        if (working_deque_size > max_deque_size_pps){
+          max_deque_size_pps = working_deque_size;
+        }
 
-      // with the GNSS fixes deque
-      am_hal_interrupt_master_disable();
+        // with the GNSS fixes deque
+        am_hal_interrupt_master_disable();
 
-      working_deque_size = deque_GNSS_readings.size();
-      if (working_deque_size > 0){
-        should_log_data = true;
-        local_gnss_reading = deque_GNSS_readings.front();
-        deque_GNSS_readings.pop_front();
-      }
+        working_deque_size = deque_GNSS_readings.size();
+        if (working_deque_size > 0){
+          should_log_data = true;
+          local_gnss_reading = deque_GNSS_readings.front();
+          deque_GNSS_readings.pop_front();
+        }
 
-      am_hal_interrupt_master_enable();
+        am_hal_interrupt_master_enable();
 
-      if (should_log_data){
-        entry_kind[0] = '\n';
-        entry_kind[1] = 'G';
-        entry_kind[2] = 'P';
-        entry_kind[3] = 'S';
-        working_millis = millis();
-        sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(entry_kind), sizeof(entry_kind));
-        sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(&local_gnss_reading), sizeof(local_gnss_reading));
-        accumulated_sd_time_millis += (millis() - working_millis);
-        should_log_data = false;
-      }
+        if (should_log_data){
+          entry_kind[0] = '\n';
+          entry_kind[1] = 'G';
+          entry_kind[2] = 'P';
+          entry_kind[3] = 'S';
+          working_millis = millis();
+          sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(entry_kind), sizeof(entry_kind));
+          sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(&local_gnss_reading), sizeof(local_gnss_reading));
+          accumulated_sd_time_millis += (millis() - working_millis);
+          should_log_data = false;
+        }
 
-      if (working_deque_size > max_deque_size_gnss){
-        max_deque_size_gnss = working_deque_size;
+        if (working_deque_size > max_deque_size_gnss){
+          max_deque_size_gnss = working_deque_size;
+        }
       }
 
       // with the IMU deque
