@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# NumPy output files
+*.npy
+*.npz
+
+# Complexipy cache
+.complexipy_cache/
+
+# Pytest cache
+.pytest_cache/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+*.png
+*.jpg
+*.pdf

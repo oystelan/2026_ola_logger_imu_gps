@@ -108,6 +108,13 @@ struct IMU_reading{
   int16_t gyr_x;
   int16_t gyr_y;
   int16_t gyr_z;
+  // Magnetometer (AK09916, inside the ICM-20948) — runs at its own internal
+  // ~100 Hz, so at our 225 Hz IMU rate ~half the records have repeated mag
+  // values (just the latest cached read). The library's getAGMT() already
+  // fetches mag, so adding these fields is essentially free.
+  int16_t mag_x;
+  int16_t mag_y;
+  int16_t mag_z;
 };
 
 char entry_kind[4];
@@ -159,6 +166,9 @@ extern "C" void am_ctimer_isr(void)
       common_isr_imu_reading.gyr_x = imu.agmt.gyr.axes.x;
       common_isr_imu_reading.gyr_y = imu.agmt.gyr.axes.y;
       common_isr_imu_reading.gyr_z = imu.agmt.gyr.axes.z;
+      common_isr_imu_reading.mag_x = imu.agmt.mag.axes.x;
+      common_isr_imu_reading.mag_y = imu.agmt.mag.axes.y;
+      common_isr_imu_reading.mag_z = imu.agmt.mag.axes.z;
 
       if (deque_IMU_readings.full()){
         deque_IMU_readings.pop_front();
@@ -796,6 +806,15 @@ void setup() {
     }
     snprintf(working_buffer, sizeof(working_buffer),
              "ICM-20948 Gyr sensitivity (mdps/LSB): %.6f\n", gyr_sensitivity);
+    SERIAL_USB->print(working_buffer);
+    sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(working_buffer), strlen(working_buffer));
+
+    // sensitivity IMU MAG (AK09916 fixed sensitivity per ICM-20948 datasheet: 0.15 uT/LSB)
+    for (size_t i=0; i<sizeof(working_buffer); i++){
+      working_buffer[i] = '\0';
+    }
+    snprintf(working_buffer, sizeof(working_buffer),
+             "ICM-20948 Mag sensitivity (uT/LSB): %.6f (AK09916 fixed)\n", 0.15f);
     SERIAL_USB->print(working_buffer);
     sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(working_buffer), strlen(working_buffer));
 
