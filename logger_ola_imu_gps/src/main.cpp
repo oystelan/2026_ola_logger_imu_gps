@@ -9,22 +9,17 @@
 #include "sd_card_manager.h"
 
 #include "Wire.h"
+#include <SPI.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
 
-#include <ISM330DHCXSensor.h>
+#include <ICM_20948.h>
 
 #include "Embedded_Template_Library.h"
 #include "etl/deque.h"
 
 
-int16_t acc_value[3];
-int16_t gyr_value[3];
-
 float acc_sensitivity = 0.0f;
 float gyr_sensitivity = 0.0f;
-
-bool acc_available = false;
-bool gyr_available = false;
 
 char working_buffer[1024];
 
@@ -34,13 +29,14 @@ SFE_UBLOX_GNSS log_GNSS;
 // static constexpr uint32_t GNSS_FREQUENCY_HZ = 1;
 static constexpr uint32_t GNSS_FREQUENCY_HZ = 10;
 
-// static constexpr float ISM330DHCX_ODR_HZ = 12.5f;
-// static constexpr float ISM330DHCX_ODR_HZ = 208.0f;
-static constexpr float ISM330DHCX_ODR_HZ = 417.0f;
+// ICM-20948 internal sample-rate is 1125 / (1 + SMPLRT_DIV); with div=4 the ODR is exactly 225 Hz on both
+// accelerometer and gyroscope. Pick this constant together with IMU_SMPLRT_DIV below.
+static constexpr float IMU_ODR_HZ = 225.0f;
+static constexpr uint16_t IMU_SMPLRT_DIV = 4;
 
 // Timer configuration
 static constexpr int TIMER_NUM = 2;
-static constexpr uint32_t TIMER_FREQ_HZ = static_cast<uint32_t>(2 * ISM330DHCX_ODR_HZ);
+static constexpr uint32_t TIMER_FREQ_HZ = static_cast<uint32_t>(2 * IMU_ODR_HZ);
 // static constexpr uint32_t TIMER_FREQ_HZ = 1000;
 static constexpr uint32_t TIMER_DIVIDER_GNSS = static_cast<uint32_t>(TIMER_FREQ_HZ / GNSS_FREQUENCY_HZ / 1.5);
 
@@ -58,16 +54,16 @@ TwoWire * I2C_QWIIC = &Wire1;
 
 static constexpr int PIN_LOG_PPS = 11; // Pin to log PPS signal from GNSS
 
-ISM330DHCXSensor AccGyr(I2C_QWIIC, ISM330DHCX_I2C_ADD_L);
+ICM_20948_SPI imu;
 
 static constexpr uint32_t seconds_in_15_minutes = 15 * 60;
 
 constexpr uint32_t PREALLOCATE_LOGFILE_SIZE_BYTES = 12 * 1024 * 1024; // Preallocate a file large enough for logging
 
-static constexpr char str_start_logging[] = "Log start OLA ISM330DHCX SAM-M10Q logger\n\n";
-static constexpr char str_stop_logging[] = "\n\nLog stop OLA ISM330DHCX SAM-M10Q logger\n";
+static constexpr char str_start_logging[] = "Log start OLA ICM-20948 logger\n\n";
+static constexpr char str_stop_logging[] = "\n\nLog stop OLA ICM-20948 logger\n";
 
-static constexpr size_t SIZE_DEQUE_IMU {20*( (int)ISM330DHCX_ODR_HZ)};
+static constexpr size_t SIZE_DEQUE_IMU {20*( (int)IMU_ODR_HZ)};
 static constexpr size_t SIZE_DEQUE_GNSS {20*GNSS_FREQUENCY_HZ};
 static constexpr size_t SIZE_DEQUE_PPS {20*1};
 
@@ -75,7 +71,6 @@ size_t working_deque_size {0};
 size_t max_deque_size_imu {0};
 size_t max_deque_size_gnss {0};
 size_t max_deque_size_pps {0};
-volatile size_t max_fifo_size_ism {0};
 
 static constexpr unsigned long time_between_stats_millis {10 * 1000};
 unsigned long accumulated_sd_time_millis {0};
@@ -149,65 +144,31 @@ extern "C" void am_ctimer_isr(void)
       SERIAL_USB->print(F(";"));
     }
 
-    // read IMU data and store in deque as many as fifo entries
-    uint16_t num_samples_available = 0;
-    AccGyr.FIFO_Get_Num_Samples(&num_samples_available);
-    if (num_samples_available > max_fifo_size_ism){
-      max_fifo_size_ism = num_samples_available;
-    }
-    if (num_samples_available > 1){
-      for (uint16_t i=0; i<num_samples_available; i++){
-        uint8_t tag;
-        // Check the FIFO tag
-        AccGyr.FIFO_Get_Tag(&tag);
-        if (ENABLE_DEBUG_FASTPRINT){
-          SERIAL_USB->print(F("T:"));
-          SERIAL_USB->print(tag);
-          SERIAL_USB->print(F(";"));
-        }
-        switch (tag) {
-          // If we have a gyro tag, read the gyro data
-          case ISM330DHCX_GYRO_NC_TAG: {
-              AccGyr.FIFO_GYRO_Get_AxesRaw(gyr_value);
-              gyr_available = true;
-              break;
-            }
-          // If we have an acc tag, read the acc data
-          case ISM330DHCX_XL_NC_TAG: {
-              AccGyr.FIFO_ACC_Get_AxesRaw(acc_value);
-              acc_available = true;
-              break;
-            }
-          // We can discard other tags
-          default: {
-              break;
-            }
-        }
+    // Poll the ICM-20948 for a fresh accel+gyro sample. The timer fires at 2*ODR so we will
+    // typically see dataReady() true on every other ISR tick. No FIFO is configured: getAGMT()
+    // reads the latest sample directly.
+    if (imu.dataReady()){
+      imu.getAGMT();
 
-        if (acc_available && gyr_available){
-          common_isr_imu_reading.micros_reading = micros();
-          common_isr_imu_reading.counter = imu_isr_count;
-          imu_isr_count++;
-          common_isr_imu_reading.acc_x = acc_value[0];
-          common_isr_imu_reading.acc_y = acc_value[1];
-          common_isr_imu_reading.acc_z = acc_value[2];
-          common_isr_imu_reading.gyr_x = gyr_value[0];
-          common_isr_imu_reading.gyr_y = gyr_value[1];
-          common_isr_imu_reading.gyr_z = gyr_value[2];
+      common_isr_imu_reading.micros_reading = micros();
+      common_isr_imu_reading.counter = imu_isr_count;
+      imu_isr_count++;
+      common_isr_imu_reading.acc_x = imu.agmt.acc.axes.x;
+      common_isr_imu_reading.acc_y = imu.agmt.acc.axes.y;
+      common_isr_imu_reading.acc_z = imu.agmt.acc.axes.z;
+      common_isr_imu_reading.gyr_x = imu.agmt.gyr.axes.x;
+      common_isr_imu_reading.gyr_y = imu.agmt.gyr.axes.y;
+      common_isr_imu_reading.gyr_z = imu.agmt.gyr.axes.z;
 
-          if (deque_IMU_readings.full()){
-            deque_IMU_readings.pop_front();
-          }
-          deque_IMU_readings.push_back(common_isr_imu_reading);
+      if (deque_IMU_readings.full()){
+        deque_IMU_readings.pop_front();
+      }
+      deque_IMU_readings.push_back(common_isr_imu_reading);
 
-          number_imu_samples_logged++;
+      number_imu_samples_logged++;
 
-          acc_available = false;
-          gyr_available = false;
-          if (ENABLE_DEBUG_FASTPRINT){
-            SERIAL_USB->print(F("DI;"));
-          }
-        }
+      if (ENABLE_DEBUG_FASTPRINT){
+        SERIAL_USB->print(F("DI;"));
       }
     }
 
@@ -349,7 +310,7 @@ void setup() {
 
   gnss_frequency_checker.start(GNSS_FREQUENCY_HZ, 45, 50.0f);
   pps_frequency_checker.start(1.0f, 45, 50.0f);
-  imu_frequency_checker.start(ISM330DHCX_ODR_HZ, 5, 30.0f);
+  imu_frequency_checker.start(IMU_ODR_HZ, 5, 30.0f);
   sd_not_saturated_checker.start(6);
 
   /////////////////////////////////////////////////////////////////////////////////
@@ -568,97 +529,85 @@ void setup() {
     }
 
     ////////////////////////////////////////////////////
-    // start and set up ISM330DHCX
+    // start and set up the built-in ICM-20948 over SPI
 
-    SERIAL_USB->println(F("Starting ISM330DHCX..."));
+    SERIAL_USB->println(F("Powering up ICM-20948..."));
+    pinMode(PIN_IMU_CHIP_SELECT, OUTPUT);
+    digitalWrite(PIN_IMU_CHIP_SELECT, HIGH); // deselect before powering
+    pinMode(PIN_IMU_POWER, OUTPUT);
+    digitalWrite(PIN_IMU_POWER, LOW);  // ensure power is off
+    delay(10);
+    digitalWrite(PIN_IMU_POWER, HIGH); // power on
+    delay(50);                         // allow ICM-20948 to come out of reset
+    wdt.restart();
 
-    if (AccGyr.begin() != ISM330DHCX_OK){
-      SERIAL_USB->println(F("problem starting ISM330DHCX"));
-      
+    SPI.begin();
+
+    SERIAL_USB->println(F("Starting ICM-20948..."));
+    imu.begin(PIN_IMU_CHIP_SELECT, SPI, IMU_SPI_MHZ * 1000000UL);
+    if (imu.status != ICM_20948_Stat_Ok){
+      SERIAL_USB->print(F("problem starting ICM-20948: "));
+      SERIAL_USB->println(imu.statusString());
+
+      digitalWrite(PIN_IMU_POWER, LOW);
       detachInterrupt(PIN_LOG_PPS);
       log_GNSS.end();
       I2C_QWIIC->end();
       delay(500);
       continue;
     }
-    SERIAL_USB->println(F("success starting ISM330DHCX"));
-    delay(100);
+    SERIAL_USB->println(F("success starting ICM-20948"));
+    delay(50);
     wdt.restart();
 
-    AccGyr.ACC_Enable();
-    delay(10);
-    AccGyr.GYRO_Enable();
-    delay(10);
+    // Make sure we are in a known state, then wake up
+    imu.swReset();
+    delay(50);
+    imu.sleep(false);
+    imu.lowPower(false);
+
+    // Continuous sampling for both accelerometer and gyroscope
+    imu.setSampleMode((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), ICM_20948_Sample_Mode_Continuous);
+
+    // Full-scale ranges: keep close to the original ISM330DHCX 2g / 125dps configuration.
+    // ICM-20948 minimum gyro range is 250dps, so we pick that.
+    ICM_20948_fss_t fss;
+    fss.a = gpm2;
+    fss.g = dps250;
+    imu.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
+
+    // Enable the digital low-pass filter at moderate bandwidth (chosen to be well above IMU_ODR_HZ / 2
+    // so it does not attenuate the signal at the chosen ODR).
+    ICM_20948_dlpcfg_t dlpcfg;
+    dlpcfg.a = acc_d111bw4_n136bw;
+    dlpcfg.g = gyr_d119bw5_n154bw3;
+    imu.setDLPFcfg((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), dlpcfg);
+    imu.enableDLPF(ICM_20948_Internal_Acc, true);
+    imu.enableDLPF(ICM_20948_Internal_Gyr, true);
+
+    // Sample rate divider — ICM-20948 internal clock is 1125 Hz, so div=4 gives 225 Hz
+    ICM_20948_smplrt_t smplrt;
+    smplrt.a = IMU_SMPLRT_DIV;
+    smplrt.g = IMU_SMPLRT_DIV;
+    imu.setSampleRate((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), smplrt);
     wdt.restart();
 
-    // interfaces to set and check power modes
-    ism330dhcx_xl_hm_mode_t acc_mode;
-    ism330dhcx_g_hm_mode_t gyro_mode;
-
-    // set power modes
-    // Set high performance mode for accelerometer
-    if (ism330dhcx_xl_power_mode_set(&AccGyr.reg_ctx, ISM330DHCX_HIGH_PERFORMANCE_MD) != 0) {
-      SERIAL_USB->println(F("ERROR: Failed to set ACC high performance mode"));
+    if (imu.status != ICM_20948_Stat_Ok){
+      SERIAL_USB->print(F("ICM-20948 configuration error: "));
+      SERIAL_USB->println(imu.statusString());
     }
-    // Set high performance mode for gyroscope  
-    if (ism330dhcx_gy_power_mode_set(&AccGyr.reg_ctx, ISM330DHCX_GY_HIGH_PERFORMANCE) != 0) {
-      SERIAL_USB->println(F("ERROR: Failed to set GYRO high performance mode"));
-    }
-    SERIAL_USB->println(F("ISM330DHCX set to HIGH PERFORMANCE mode"));
 
-    AccGyr.ACC_SetOutputDataRate(ISM330DHCX_ODR_HZ);
-    delay(10);
-    AccGyr.GYRO_SetOutputDataRate(ISM330DHCX_ODR_HZ);
-    delay(10);
-    wdt.restart();
-
-    AccGyr.ACC_SetFullScale(ISM330DHCX_2g);
-    delay(10);
-    AccGyr.GYRO_SetFullScale(ISM330DHCX_125dps);
-    delay(10);
-    wdt.restart();
-
-    AccGyr.FIFO_ACC_Set_BDR(ISM330DHCX_ODR_HZ);
-    delay(10);
-    AccGyr.FIFO_GYRO_Set_BDR(ISM330DHCX_ODR_HZ);
-    delay(10);
-    wdt.restart();
-
-    float ODR_read;
-    AccGyr.ACC_GetOutputDataRate(&ODR_read);
-    SERIAL_USB->print(F("ISM330DHCX Acc ODR set to: "));
-    SERIAL_USB->println(ODR_read);
-    delay(10);
-    AccGyr.GYRO_GetOutputDataRate(&ODR_read);
-    SERIAL_USB->print(F("ISM330DHCX Gyr ODR set to: "));
-    SERIAL_USB->println(ODR_read);
-    delay(10);
-    wdt.restart();
-
-    // get sensitivity and print it
-    AccGyr.ACC_GetSensitivity(&acc_sensitivity);
-    SERIAL_USB->print(F("ISM330DHCX Acc sensitivity (mg/LSB): "));
+    // Sensitivity values matching the chosen full-scale ranges. ICM-20948 datasheet:
+    //   accel  +/-2g    -> 16384 LSB/g  -> 0.061035 mg/LSB
+    //   gyro +/-250dps -> 131 LSB/dps -> 7.633588 mdps/LSB
+    acc_sensitivity = 1000.0f / 16384.0f;
+    gyr_sensitivity = 1000.0f / 131.0f;
+    SERIAL_USB->print(F("ICM-20948 Acc sensitivity (mg/LSB): "));
     SERIAL_USB->println(acc_sensitivity, 6);
-    delay(10);
-    AccGyr.GYRO_GetSensitivity(&gyr_sensitivity);
-    SERIAL_USB->print(F("ISM330DHCX Gyr sensitivity (mdps/LSB): "));
+    SERIAL_USB->print(F("ICM-20948 Gyr sensitivity (mdps/LSB): "));
     SERIAL_USB->println(gyr_sensitivity, 6);
-    delay(10);
-    wdt.restart();
-  
-    AccGyr.FIFO_Set_Mode(ISM330DHCX_FIFO_MODE);
-    delay(10);
-    wdt.restart();
 
-    // Verify power modes
-    ism330dhcx_xl_power_mode_get(&AccGyr.reg_ctx, &acc_mode);
-    ism330dhcx_gy_power_mode_get(&AccGyr.reg_ctx, &gyro_mode);
-    SERIAL_USB->print(F("ACC mode: "));
-    SERIAL_USB->println(acc_mode == ISM330DHCX_HIGH_PERFORMANCE_MD ? "HIGH_PERFORMANCE" : "LOW_POWER");
-    SERIAL_USB->print(F("GYRO mode: "));
-    SERIAL_USB->println(gyro_mode == ISM330DHCX_GY_HIGH_PERFORMANCE ? "HIGH_PERFORMANCE" : "NORMAL");
-
-    SERIAL_USB->println(F("ISM330DHCX setup complete."));
+    SERIAL_USB->println(F("ICM-20948 setup complete."));
 
     ////////////////////////////////////////////////////
     SERIAL_USB->println(F("All set up, ready to log: start isr timer..."));
@@ -796,7 +745,7 @@ void setup() {
       working_buffer[i] = '\0';
     }
     snprintf(working_buffer, sizeof(working_buffer),
-             "ISM330DHCX Acc sensitivity (mg/LSB): %.6f\n", acc_sensitivity);
+             "ICM-20948 Acc sensitivity (mg/LSB): %.6f\n", acc_sensitivity);
     SERIAL_USB->print(working_buffer);
     sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(working_buffer), strlen(working_buffer));
 
@@ -805,7 +754,7 @@ void setup() {
       working_buffer[i] = '\0';
     }
     snprintf(working_buffer, sizeof(working_buffer),
-             "ISM330DHCX Gyr sensitivity (mdps/LSB): %.6f\n", gyr_sensitivity);
+             "ICM-20948 Gyr sensitivity (mdps/LSB): %.6f\n", gyr_sensitivity);
     SERIAL_USB->print(working_buffer);
     sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(working_buffer), strlen(working_buffer));
 
@@ -814,7 +763,7 @@ void setup() {
       working_buffer[i] = '\0';
     }
     snprintf(working_buffer, sizeof(working_buffer),
-             "ISM330DHCX ODR (Hz): %.2f\n", ISM330DHCX_ODR_HZ);
+             "ICM-20948 ODR (Hz): %.2f\n", IMU_ODR_HZ);
     SERIAL_USB->print(working_buffer);
     sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(working_buffer), strlen(working_buffer));
 
@@ -860,11 +809,9 @@ void setup() {
         unsigned long imu_samples = number_imu_samples_logged;
         unsigned long gnss_fixes = number_gnss_fixes_logged;
         unsigned long pps_fixes = number_pps_fixes_logged;
-        size_t max_fifo_ism = max_fifo_size_ism;
         number_imu_samples_logged = 0;
         number_gnss_fixes_logged = 0;
         number_pps_fixes_logged = 0;
-        max_fifo_size_ism = 0;
         am_hal_interrupt_master_enable();
 
         // compute effective logging rates
@@ -893,10 +840,6 @@ void setup() {
         SERIAL_USB->print(max_deque_size_imu);
         SERIAL_USB->print(F(" over "));
         SERIAL_USB->print(SIZE_DEQUE_IMU);
-        SERIAL_USB->print(F("; ISM FIFO: "));
-        SERIAL_USB->print(max_fifo_ism);
-        SERIAL_USB->print(F(" over "));
-        SERIAL_USB->print(F("512"));  // determined from test with similar setup
         SERIAL_USB->print(F("; GNSS: "));
         SERIAL_USB->print(max_deque_size_gnss);
         SERIAL_USB->print(F(" over "));
