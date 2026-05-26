@@ -44,6 +44,14 @@ static constexpr int SD_SPI_MHZ {50};
 static constexpr int SD_PWR {15};
 
 //////////////////////////////////////////////////////////////////////////////////////////
+// Built-in 9DoF IMU (ICM-20948) on SparkFun OLA — SPI
+
+static constexpr int PIN_IMU_CHIP_SELECT {44};
+static constexpr int PIN_IMU_POWER {27};
+static constexpr int PIN_IMU_INT {37};
+static constexpr int IMU_SPI_MHZ {4};
+
+//////////////////////////////////////////////////////////////////////////////////////////
 // misc
 
 static constexpr char commit_id[] {STRINGIFY_CONTENT(REPO_COMMIT_ID)};
