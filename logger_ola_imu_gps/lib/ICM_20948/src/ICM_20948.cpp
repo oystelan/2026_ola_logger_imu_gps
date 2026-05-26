@@ -1927,10 +1927,9 @@ ICM_20948_Status_e ICM_20948_SPI::begin(uint8_t csPin, SPIClass &spiPort, uint32
 
   // _spi->begin(); // Moved into user's sketch
 
-  // 'Kickstart' the SPI hardware.
-  _spi->beginTransaction(_spisettings);
-  _spi->transfer(0x00);
-  _spi->endTransaction();
+  // (Original "kickstart" `_spi->transfer(0x00)` removed: on Apollo3 v1.2.3 it
+  // uses the broken per-byte path. The new multi-byte read/write functions
+  // below don't need a kickstart.)
 
   // Set up the serif
   _serif.write = ICM_20948_write_SPI;
@@ -2040,35 +2039,43 @@ ICM_20948_Status_e ICM_20948_read_I2C(uint8_t reg, uint8_t *buff, uint32_t len, 
   return ICM_20948_Stat_Ok;
 }
 
+// Apollo3 v1.2.3 SPI workaround: replace the per-byte transfer pattern (which
+// pushes 4 bytes to the IOM TX FIFO per call, leaving 3 garbage bytes that
+// get clocked out as MOSI on the next byte transfer) with a SINGLE multi-byte
+// fullduplex transfer carrying address + data. Combined with the framework
+// HAL patch (am_hal_iom_spi_blocking_fullduplex now drains partial FIFO on
+// CMDCMP), short transfers no longer return garbage.
+//
+// ALSO: re-apply the 1.5KΩ pull-up on MISO (pad 6) at the start of every
+// transaction. The SD card's SPI.beginTransaction() (and our own) reset
+// the pad's pull-up, and without it the OLA's MISO can't rise fast enough
+// at 4 MHz to read correctly. SparkFun's OLA firmware does this via
+// enableCIPOpullUp() but that only protects the FIRST transaction unless
+// re-applied.
+static inline void icm20948_reapply_miso_pullup() {
+  am_hal_gpio_pincfg_t cfg = g_AM_BSP_GPIO_IOM0_MISO;
+  cfg.ePullup = AM_HAL_GPIO_PIN_PULLUP_1_5K;
+  am_hal_gpio_pinconfig(6 /* MISO pad on OLA */, cfg);
+}
+
 ICM_20948_Status_e ICM_20948_write_SPI(uint8_t reg, uint8_t *data, uint32_t len, void *user)
 {
-  if (user == NULL)
-  {
-    return ICM_20948_Stat_ParamErr;
-  }
-  SPIClass *_spi = ((ICM_20948_SPI *)user)->_spi; // Cast user field to ICM_20948_SPI type and extract the SPI interface pointer
+  if (user == NULL) return ICM_20948_Stat_ParamErr;
+  SPIClass *_spi = ((ICM_20948_SPI *)user)->_spi;
   uint8_t cs = ((ICM_20948_SPI *)user)->_cs;
   SPISettings spisettings = ((ICM_20948_SPI *)user)->_spisettings;
-  if (_spi == NULL)
-  {
-    return ICM_20948_Stat_ParamErr;
-  }
+  if (_spi == NULL) return ICM_20948_Stat_ParamErr;
 
-  // 'Kickstart' the SPI hardware. This is a fairly high amount of overhead, but it guarantees that the lines will start in the correct states even when sharing the SPI bus with devices that use other modes
-  _spi->beginTransaction(spisettings);
-  _spi->transfer(0x00);
-  _spi->endTransaction();
+  uint32_t total = 1 + len;
+  uint8_t tx_buf[total];
+  uint8_t rx_buf[total];
+  tx_buf[0] = (reg & 0x7F);  // write: top bit clear
+  for (uint32_t i = 0; i < len; i++) tx_buf[1 + i] = data[i];
 
   _spi->beginTransaction(spisettings);
+  icm20948_reapply_miso_pullup();  // beginTransaction may have reset the pad
   digitalWrite(cs, LOW);
-  // delayMicroseconds(5);
-  _spi->transfer(((reg & 0x7F) | 0x00));
-  //  SPI.transfer(data, len); // Can't do this thanks to Arduino's poor implementation
-  for (uint32_t indi = 0; indi < len; indi++)
-  {
-    _spi->transfer(*(data + indi));
-  }
-  // delayMicroseconds(5);
+  _spi->transferOutIn(tx_buf, rx_buf, total);
   digitalWrite(cs, HIGH);
   _spi->endTransaction();
 
@@ -2077,35 +2084,27 @@ ICM_20948_Status_e ICM_20948_write_SPI(uint8_t reg, uint8_t *data, uint32_t len,
 
 ICM_20948_Status_e ICM_20948_read_SPI(uint8_t reg, uint8_t *buff, uint32_t len, void *user)
 {
-  if (user == NULL)
-  {
-    return ICM_20948_Stat_ParamErr;
-  }
+  if (user == NULL) return ICM_20948_Stat_ParamErr;
   SPIClass *_spi = ((ICM_20948_SPI *)user)->_spi;
   uint8_t cs = ((ICM_20948_SPI *)user)->_cs;
   SPISettings spisettings = ((ICM_20948_SPI *)user)->_spisettings;
-  if (_spi == NULL)
-  {
-    return ICM_20948_Stat_ParamErr;
-  }
+  if (_spi == NULL) return ICM_20948_Stat_ParamErr;
 
-  // 'Kickstart' the SPI hardware. This is a fairly high amount of overhead, but it guarantees that the lines will start in the correct states
-  _spi->beginTransaction(spisettings);
-  _spi->transfer(0x00);
-  _spi->endTransaction();
+  uint32_t total = 1 + len;
+  uint8_t tx_buf[total];
+  uint8_t rx_buf[total];
+  tx_buf[0] = (reg & 0x7F) | 0x80;   // read: top bit set
+  for (uint32_t i = 1; i < total; i++) tx_buf[i] = 0;
 
   _spi->beginTransaction(spisettings);
+  icm20948_reapply_miso_pullup();  // beginTransaction may have reset the pad
   digitalWrite(cs, LOW);
-  //   delayMicroseconds(5);
-  _spi->transfer(((reg & 0x7F) | 0x80));
-  //  SPI.transfer(data, len); // Can't do this thanks to Arduino's stupid implementation
-  for (uint32_t indi = 0; indi < len; indi++)
-  {
-    *(buff + indi) = _spi->transfer(0x00);
-  }
-  //   delayMicroseconds(5);
+  _spi->transferOutIn(tx_buf, rx_buf, total);
   digitalWrite(cs, HIGH);
   _spi->endTransaction();
+
+  // rx_buf[0] is junk clocked during the address byte; rx_buf[1..] is the data.
+  for (uint32_t i = 0; i < len; i++) buff[i] = rx_buf[1 + i];
 
   return ICM_20948_Stat_Ok;
 }

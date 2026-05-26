@@ -5,6 +5,16 @@
 
 #include "sd_card_manager.h"
 
+// RAII helper: while in scope, mask the IMU CTIMER interrupt (CTIMER_IRQn).
+// The IMU ISR talks to the IMU over the same SPI bus we use for the SD card,
+// so any SD SPI transaction must run uninterrupted. After this guard goes
+// out of scope, the CTIMER interrupt is re-enabled and any pending IMU tick
+// gets serviced.
+struct SDIrqGuard {
+    SDIrqGuard()  { NVIC_DisableIRQ(CTIMER_IRQn); }
+    ~SDIrqGuard() { NVIC_EnableIRQ(CTIMER_IRQn);  }
+};
+
 bool toogle_state_led = false;
 
 // Global instance
@@ -75,12 +85,18 @@ bool SD_Card_Manager::start() {
     if (sd_initialized) {
         return true;
     }
-    
+
+    SDIrqGuard _guard;  // pause IMU sample ISR for the duration of SD init
+
     microSDPowerOn();
-    
+
     SERIAL_USB->println(F("Initializing SD card..."));
     
-    SdSpiConfig sd_config{SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(SD_SPI_MHZ)};
+    // SHARED_SPI (not DEDICATED_SPI) because the OLA's IMU lives on the same
+    // SPI bus. With DEDICATED_SPI, SdFat assumes exclusive access and skips
+    // beginTransaction/endTransaction, which leaves the IOM configured for
+    // the previous device (the IMU at 4 MHz) and SD CMD8 fails.
+    SdSpiConfig sd_config{SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(SD_SPI_MHZ)};
     
     if (!sd_card.begin(sd_config)) {
         SERIAL_USB->println(F("ERROR: SD card initialization failed!"));
@@ -139,11 +155,13 @@ bool SD_Card_Manager::preallocate_and_open_file(uint32_t size_bytes, bool use_fo
         SERIAL_USB->println(F("ERROR: SD card not initialized"));
         return false;
     }
-    
+
+    SDIrqGuard _guard;  // SD opens/preallocate do lots of SPI traffic — pause IMU ISR
+
     if (file_open) {
         close_and_sync_file();
     }
-    
+
     generate_filename(use_folders);
     
     // Extract folder name from filename_buffer if using folders (format: BOOT_XXXXXX/DATA_BOOT_...)
@@ -235,7 +253,9 @@ void SD_Card_Manager::close_and_sync_file() {
     if (!file_open) {
         return;
     }
-    
+
+    SDIrqGuard _guard;  // sync/close are long-running SD SPI ops; pause IMU ISR
+
     SERIAL_USB->println(F("Syncing and closing file..."));
     
 #ifdef USE_RINGBUFF
@@ -262,7 +282,9 @@ bool SD_Card_Manager::write_buffer(const uint8_t* buffer, size_t size) {
         SERIAL_USB->println(F("ERROR: No file open for writing"));
         return false;
     }
-    
+
+    SDIrqGuard _guard;  // protect SD SPI writes from being preempted by IMU ISR
+
 #ifdef USE_RINGBUFF
     digitalWrite(PIN_STAT_LED, HIGH);
     // Check if we need to flush before writing new data

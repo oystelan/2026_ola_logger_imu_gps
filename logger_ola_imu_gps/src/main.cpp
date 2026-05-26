@@ -44,8 +44,8 @@ static constexpr uint32_t SERIAL_TIMEOUT_MS = 5000;      ///< Max wait for seria
 
 static constexpr bool ENABLE_BLINK_PWR_LED = false;          ///< Enable power LED blinking on startup
 static constexpr bool ENABLE_BOOT_COUNTER = true;          ///< Enable boot counter functionality
-static constexpr bool ENABLE_GNSS = false;                   ///< Master switch for GNSS module (begin, ISR read, PPS, deque write)
-static constexpr bool ENABLE_GNSS_START = ENABLE_GNSS;       ///< Wait for an initial GNSS fix at boot to set the RTC
+static constexpr bool ENABLE_GNSS = true;                    ///< Master switch for GNSS module (begin, ISR read, PPS, deque write)
+static constexpr bool ENABLE_GNSS_START = true;              ///< Wait for an initial GNSS fix at boot to set the RTC; STAT LED blinks 5x once UTC is synced
 static constexpr bool ENABLE_DEBUG_FASTPRINT = false;
 
 static constexpr bool USE_BURSTMODE = true;
@@ -131,7 +131,7 @@ extern "C" void am_ctimer_isr(void)
   // Get interrupt status and clear
   uint32_t ui32Status = am_hal_ctimer_int_status_get(true);
   am_hal_ctimer_int_clear(ui32Status);
-  
+
   // Check if it's timer 2A interrupt (reload/overflow)
   if (ui32Status & AM_HAL_CTIMER_INT_TIMERA2)
   {
@@ -420,6 +420,11 @@ void setup() {
           gnss_manager.get_a_fix(10, false, false, false);
         }
         gnss_manager.get_a_fix(10, true, false, false);
+        // Visual confirmation: UTC has been synced from GNSS. 5 STAT-LED blinks
+        // before we proceed to IMU/SD setup and start logging. Useful when the
+        // device is outside and you can't see the serial monitor.
+        SERIAL_USB->println(F("UTC synced from GNSS — blinking STAT LED 5x"));
+        blink_stat_led(5);
       }
     }
     board_time_manager.print_status();
@@ -442,7 +447,7 @@ void setup() {
 
     wdt.restart();
     delay(10);
-    
+
     ////////////////////////////////////////////////////
     // start I2C port
 
@@ -531,20 +536,55 @@ void setup() {
     ////////////////////////////////////////////////////
     // start and set up the built-in ICM-20948 over SPI
 
+    // ----------------------------------------------------------------
+    // CRITICAL ORDER on the OLA: power on the microSD card module BEFORE
+    // the IMU init. The SD card module provides a hardware pull-up on
+    // MISO (shared with the IMU). Without SD powered, MISO rise time is
+    // too slow at 4 MHz and the ICM-20948 WHO_AM_I read comes back
+    // corrupted as 0xE0 instead of 0xEA. SparkFun's reference OLA
+    // firmware always calls beginSD() before beginIMU() for this reason.
+    // ----------------------------------------------------------------
+    SERIAL_USB->println(F("Powering up microSD card (for shared SPI MISO pull-up)..."));
+    pinMode(SD_PWR, OUTPUT);
+    am_hal_gpio_pinconfig(SD_PWR, g_AM_HAL_GPIO_OUTPUT);
+    digitalWrite(SD_PWR, LOW);   // SD power is active-LOW (LOW = ON)
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);  // deselect SD so it tri-states its MISO
+    delay(50);                      // SD card needs time to power up
+    wdt.restart();
+
     SERIAL_USB->println(F("Powering up ICM-20948..."));
+    // SparkFun's OLA reference forcibly resets pad funcsel to GPIO for these two pads.
+    // Without this, pinMode() alone may not override alternate functions on some pads.
     pinMode(PIN_IMU_CHIP_SELECT, OUTPUT);
+    am_hal_gpio_pinconfig(PIN_IMU_CHIP_SELECT, g_AM_HAL_GPIO_OUTPUT);
     digitalWrite(PIN_IMU_CHIP_SELECT, HIGH); // deselect before powering
     pinMode(PIN_IMU_POWER, OUTPUT);
+    am_hal_gpio_pinconfig(PIN_IMU_POWER, g_AM_HAL_GPIO_OUTPUT);
     digitalWrite(PIN_IMU_POWER, LOW);  // ensure power is off
     delay(10);
     digitalWrite(PIN_IMU_POWER, HIGH); // power on
-    delay(50);                         // allow ICM-20948 to come out of reset
+    delay(100);                        // SparkFun reference firmware waits 100ms before talking SPI
     wdt.restart();
 
     SPI.begin();
 
+    // Enable Apollo3 internal 1.5KΩ pull-up on MISO (pad 6). Combined with
+    // the SD card module's MISO pull-up (above), this gives MISO enough
+    // drive strength to rise cleanly at 4 MHz SPI.
+    {
+      am_hal_gpio_pincfg_t cipoPinCfg = g_AM_BSP_GPIO_IOM0_MISO;
+      cipoPinCfg.ePullup = AM_HAL_GPIO_PIN_PULLUP_1_5K;
+      am_hal_gpio_pinconfig(6 /* MISO pad */, cipoPinCfg);
+    }
+
     SERIAL_USB->println(F("Starting ICM-20948..."));
-    imu.begin(PIN_IMU_CHIP_SELECT, SPI, IMU_SPI_MHZ * 1000000UL);
+    for (int imu_try = 0; imu_try < 3; imu_try++) {
+      imu.begin(PIN_IMU_CHIP_SELECT, SPI, IMU_SPI_MHZ * 1000000UL);
+      if (imu.status == ICM_20948_Stat_Ok) break;
+      delay(10);
+      wdt.restart();
+    }
     if (imu.status != ICM_20948_Stat_Ok){
       SERIAL_USB->print(F("problem starting ICM-20948: "));
       SERIAL_USB->println(imu.statusString());
@@ -610,45 +650,35 @@ void setup() {
     SERIAL_USB->println(F("ICM-20948 setup complete."));
 
     ////////////////////////////////////////////////////
-    SERIAL_USB->println(F("All set up, ready to log: start isr timer..."));
+    SERIAL_USB->println(F("Configuring (but NOT yet starting) IMU sample timer..."));
 
     // Power up the clock
     am_hal_clkgen_control(AM_HAL_CLKGEN_CONTROL_SYSCLK_MAX, 0);
-    
+
     // Stop timer
     am_hal_ctimer_stop(TIMER_NUM, AM_HAL_CTIMER_TIMERA);
-    
+
     // Clear timer
     am_hal_ctimer_clear(TIMER_NUM, AM_HAL_CTIMER_TIMERA);
-    
-    // Configure timer in REPEAT mode with 3MHz clock
+
+    // Configure timer in REPEAT mode with 187.5 kHz source clock
     am_hal_ctimer_config_single(TIMER_NUM, AM_HAL_CTIMER_TIMERA,
-                                (AM_HAL_CTIMER_FN_REPEAT | 
+                                (AM_HAL_CTIMER_FN_REPEAT |
                                   AM_HAL_CTIMER_HFRC_187_5KHZ |
                                   AM_HAL_CTIMER_INT_ENABLE));
-    
+
     // Set the period for the timer
     static constexpr uint32_t period = 187500 / TIMER_FREQ_HZ;
     static_assert(period < 0xFFFF, "Timer period too large for 16-bit timer");
     static_assert(period > 1, "Timer period must be greater than one");
     am_hal_ctimer_period_set(TIMER_NUM, AM_HAL_CTIMER_TIMERA, period, 0);
-    
+
     // Clear any pending interrupts
     am_hal_ctimer_int_clear(AM_HAL_CTIMER_INT_TIMERA2);
-    
-    // Enable the timer interrupt in main CTIMER register
-    am_hal_ctimer_int_enable(AM_HAL_CTIMER_INT_TIMERA2);
-    
-    // Enable interrupt at NVIC level
-    NVIC_EnableIRQ(CTIMER_IRQn);
-    
-    // Start the timer
-    am_hal_ctimer_start(TIMER_NUM, AM_HAL_CTIMER_TIMERA);
-    
-    // Enable global interrupts after timer is fully configured and started
-    am_hal_interrupt_master_enable();
-    
-    Serial.println(F("Timer started!"));
+
+    // NOTE: timer interrupts and timer start are DEFERRED until after SD card
+    // is initialized. The IMU ISR does SPI transactions; if it fires during
+    // SdFat init it corrupts SD's command/response sequence and SD init fails.
     wdt.restart();
 
     setup_successful = true;
@@ -683,6 +713,17 @@ void setup() {
       // Watchdog will reset the board
     }
   }
+  wdt.restart();
+
+  // SD is up. NOW it's safe to enable the IMU sample timer and start it.
+  // (Doing this earlier means the IMU ISR's SPI traffic collides with SdFat's
+  // SD init traffic on the same shared SPI bus, breaking SD init.)
+  SERIAL_USB->println(F("Starting IMU sample timer..."));
+  am_hal_ctimer_int_enable(AM_HAL_CTIMER_INT_TIMERA2);
+  NVIC_EnableIRQ(CTIMER_IRQn);
+  am_hal_ctimer_start(TIMER_NUM, AM_HAL_CTIMER_TIMERA);
+  am_hal_interrupt_master_enable();
+  SERIAL_USB->println(F("Timer started!"));
   wdt.restart();
 
   uint32_t posix_timestamp;

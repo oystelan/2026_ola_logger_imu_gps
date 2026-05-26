@@ -13,7 +13,7 @@
 #include "print_utils.h"
 
 //////////////////////////////////////////////////////////////////////////////////////////
-// serial over USB related 
+// serial over USB related
 
 extern Uart * SERIAL_USB;
 static constexpr int BAUD_RATE_USB {1000000};
