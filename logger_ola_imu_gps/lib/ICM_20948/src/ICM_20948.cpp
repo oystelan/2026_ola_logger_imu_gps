@@ -1315,6 +1315,41 @@ ICM_20948_Status_e ICM_20948::readFIFO(uint8_t *data, uint8_t len)
   return status;
 }
 
+// Local extension: configure which sensors get pushed to the FIFO. Writes
+// FIFO_EN_2 in user bank 0. Each sample in FIFO is, in order:
+//   6 bytes accel (xH, xL, yH, yL, zH, zL) if accel=true
+//   6 bytes gyro  (xH, xL, yH, yL, zH, zL) if gyro_xyz=true
+//   2 bytes temp                            if temp=true
+// Per-sample size is the sum of those. Magnetometer (an I2C peripheral) is
+// not enabled by this method — use FIFO_EN_1 / PERIPH_*_FIFO_EN for that.
+ICM_20948_Status_e ICM_20948::debugReadReg(uint8_t bank, uint8_t regaddr, uint8_t *value)
+{
+  status = ICM_20948_set_bank(&_device, bank);
+  if (status != ICM_20948_Stat_Ok)
+  {
+    return status;
+  }
+  status = ICM_20948_execute_r(&_device, regaddr, value, 1);
+  return status;
+}
+
+ICM_20948_Status_e ICM_20948::setFIFOdataAccelGyroTemp(bool accel, bool gyro_xyz, bool temp)
+{
+  status = ICM_20948_set_bank(&_device, 0);
+  if (status != ICM_20948_Stat_Ok)
+  {
+    return status;
+  }
+  ICM_20948_FIFO_EN_2_t cfg = {0};
+  cfg.ACCEL_FIFO_EN  = accel    ? 1 : 0;
+  cfg.GYRO_X_FIFO_EN = gyro_xyz ? 1 : 0;
+  cfg.GYRO_Y_FIFO_EN = gyro_xyz ? 1 : 0;
+  cfg.GYRO_Z_FIFO_EN = gyro_xyz ? 1 : 0;
+  cfg.TEMP_FIFO_EN   = temp     ? 1 : 0;
+  status = ICM_20948_execute_w(&_device, AGB0_REG_FIFO_EN_2, (uint8_t *)&cfg, 1);
+  return status;
+}
+
 // DMP
 
 ICM_20948_Status_e ICM_20948::enableDMP(bool enable)

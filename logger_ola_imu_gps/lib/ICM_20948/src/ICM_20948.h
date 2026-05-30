@@ -171,6 +171,11 @@ public:
   ICM_20948_Status_e setFIFOmode(bool snapshot = false); // Default to Stream (non-Snapshot) mode
   ICM_20948_Status_e getFIFOcount(uint16_t *count);
   ICM_20948_Status_e readFIFO(uint8_t *data, uint8_t len = 1);
+  // Local extension (not in upstream library): choose which sensors get pushed
+  // to FIFO. Writes register FIFO_EN_2 in user bank 0.
+  ICM_20948_Status_e setFIFOdataAccelGyroTemp(bool accel, bool gyro_xyz, bool temp);
+  // Local extension: read one byte from any bank/register for debugging.
+  ICM_20948_Status_e debugReadReg(uint8_t bank, uint8_t regaddr, uint8_t *value);
 
   //DMP
 
