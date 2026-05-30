@@ -73,11 +73,23 @@ FOOTER_MARKER = b"Log stop OLA"
 MARKER_SIZE = 4
 PPS_STRUCT_SIZE = 4
 GPS_STRUCT_SIZE = 36
+# When firmware logs altitude_msl_mm (int32, +4 bytes): 33 data bytes + 3 pad = 36
+# vs. 37 data bytes + 3 pad = 40 with altitude. Detection key in header:
+# "GNSS includes altitude_msl".
+GPS_STRUCT_SIZE_WITH_ALTITUDE = 40
 IMU_STRUCT_SIZE = 18
 IMU_PADDING = 2  # C struct alignment padding
+# Two on-disk record sizes for the IMU struct depending on whether the
+# firmware logs the magnetometer (mag_x/y/z, +6 bytes):
+#   - 18-byte struct + 2 padding = 20 bytes per record (no mag, legacy)
+#   - 24-byte struct + 0 padding = 24 bytes per record (with mag, since 24 is 4-aligned)
+IMU_STRUCT_SIZE_WITH_MAG = 24
+IMU_PADDING_WITH_MAG = 0
 PPS_LINE_SIZE = MARKER_SIZE + PPS_STRUCT_SIZE  # 8 bytes
-GPS_LINE_SIZE = MARKER_SIZE + GPS_STRUCT_SIZE  # 40 bytes
+GPS_LINE_SIZE = MARKER_SIZE + GPS_STRUCT_SIZE  # 40 bytes (legacy, no altitude)
+GPS_LINE_SIZE_WITH_ALTITUDE = MARKER_SIZE + GPS_STRUCT_SIZE_WITH_ALTITUDE  # 44 bytes
 IMU_LINE_SIZE = MARKER_SIZE + IMU_STRUCT_SIZE + IMU_PADDING  # 24 bytes (4 + 18 + 2)
+IMU_LINE_SIZE_WITH_MAG = MARKER_SIZE + IMU_STRUCT_SIZE_WITH_MAG + IMU_PADDING_WITH_MAG  # 28 bytes
 
 
 @dataclass
@@ -109,6 +121,10 @@ class GNSSReading:
     ned_vel_east_mmps: int
     ned_vel_down_mmps: int
     datetime_utc: datetime
+    # Altitude above mean sea level, only populated when firmware logs it.
+    # 0.0 / 0 are the sentinel values for "no altitude in this record".
+    altitude_msl_mm: int = 0
+    altitude_msl_m: float = 0.0
     micros_reading_unwrapped: int | None = None
     utc_timestamp_from_pps_regression: float | None = None
     datetime_timestamp_from_pps_regression: datetime | None = None
@@ -118,11 +134,18 @@ class GNSSReading:
     ned_vel_north_mmps_stdchecked: bool = False
     ned_vel_east_mmps_stdchecked: bool = False
     ned_vel_down_mmps_stdchecked: bool = False
+    altitude_msl_m_stdchecked: bool = False
 
 
 @dataclass
 class IMUReading:
-    """IMU reading data structure."""
+    """IMU reading data structure.
+
+    The magnetometer fields (mag_x/y/z, mag_*_uT) are set when the firmware
+    logs the magnetometer (ICM-20948 with AK09916). On legacy data without
+    mag, these stay at their default 0 values — check the presence of
+    'mag_sensitivity' in the header to know whether the column is meaningful.
+    """
 
     micros_reading: int
     counter: int
@@ -138,6 +161,13 @@ class IMUReading:
     gyr_x_mdps: float
     gyr_y_mdps: float
     gyr_z_mdps: float
+    # Magnetometer (AK09916, only populated when firmware logs mag)
+    mag_x: int = 0
+    mag_y: int = 0
+    mag_z: int = 0
+    mag_x_uT: float = 0.0
+    mag_y_uT: float = 0.0
+    mag_z_uT: float = 0.0
     micros_reading_unwrapped: int | None = None
     counter_unwrapped: int | None = None
     utc_timestamp_from_pps_regression: float | None = None
@@ -149,6 +179,9 @@ class IMUReading:
     gyr_x_mdps_stdchecked: bool = False
     gyr_y_mdps_stdchecked: bool = False
     gyr_z_mdps_stdchecked: bool = False
+    mag_x_uT_stdchecked: bool = False
+    mag_y_uT_stdchecked: bool = False
+    mag_z_uT_stdchecked: bool = False
 
 
 def parse_header(
@@ -178,16 +211,33 @@ def parse_header(
     header_text = content[:header_end].decode("utf-8", errors="ignore")
     header_lines = header_text.splitlines()
 
+    # Match the sensitivity/ODR lines by their SUFFIX (units / label), not by
+    # the chip name prefix, so the parser keeps working when the IMU is swapped.
+    # Original used "ISM330DHCX Acc sensitivity"; the OLA's built-in IMU emits
+    # "ICM-20948 Acc sensitivity"; future chips will follow the same pattern.
     for line in header_lines:
-        if "ISM330DHCX Acc sensitivity" in line:
+        if "Acc sensitivity" in line:
             parts = line.split(":")
             if len(parts) == 2:
                 header_info["acc_sensitivity"] = float(parts[1].strip())
-        elif "ISM330DHCX Gyr sensitivity" in line:
+        elif "Gyr sensitivity" in line:
             parts = line.split(":")
             if len(parts) == 2:
                 header_info["gyr_sensitivity"] = float(parts[1].strip())
-        elif "ISM330DHCX ODR" in line:
+        elif "Mag sensitivity" in line:
+            # AK09916 inside the ICM-20948. Header line example:
+            #   "ICM-20948 Mag sensitivity (uT/LSB): 0.150000 (AK09916 fixed)"
+            # Take the first numeric token after the colon.
+            parts = line.split(":")
+            if len(parts) >= 2:
+                # Strip trailing "(AK09916 fixed)" annotation and parse.
+                rhs = parts[1].strip().split()[0]
+                try:
+                    header_info["mag_sensitivity"] = float(rhs)
+                except ValueError:
+                    pass
+        elif "ODR" in line and "Hz" in line:
+            # "ICM-20948 ODR (Hz): 225.00" — chip-agnostic match on "ODR" + "Hz".
             parts = line.split(":")
             if len(parts) == 2:
                 header_info["imu_odr"] = float(parts[1].strip())
@@ -195,6 +245,10 @@ def parse_header(
             parts = line.split(":")
             if len(parts) == 2:
                 header_info["gnss_rate"] = float(parts[1].strip())
+        elif "GNSS includes altitude_msl" in line:
+            # Marker line from firmware versions that log altitude in the
+            # GNSS struct. Triggers the wider GPS record parsing path.
+            header_info["gnss_has_altitude"] = True
         elif "Firmware commit ID" in line:
             parts = line.split(":")
             if len(parts) == 2:
@@ -767,6 +821,13 @@ def parse_pps_entry(data: bytes) -> PPSFix:
 def parse_gnss_entry(data: bytes) -> GNSSReading:
     """Parse a single GNSS entry.
 
+    Two on-disk sizes are accepted:
+      - GPS_STRUCT_SIZE (36): legacy layout, no altitude.
+      - GPS_STRUCT_SIZE_WITH_ALTITUDE (40): adds int32 altitude_msl_mm
+        (mm above mean sea level) right before fix_type.
+    Selection is by len(data); the upstream segmenter picks the size from
+    the header's "GNSS includes altitude_msl" marker.
+
     Args:
         data: Raw binary data for GNSS entry
 
@@ -776,13 +837,22 @@ def parse_gnss_entry(data: bytes) -> GNSSReading:
     Raises:
         AssertionError: If data size is incorrect
     """
-    assert len(data) == GPS_STRUCT_SIZE, (
-        f"GNSS data size mismatch: expected exactly {GPS_STRUCT_SIZE} bytes "
-        f"(33 bytes struct + 3 bytes padding), got {len(data)} bytes"
+    assert len(data) in (GPS_STRUCT_SIZE, GPS_STRUCT_SIZE_WITH_ALTITUDE), (
+        f"GNSS data size mismatch: expected {GPS_STRUCT_SIZE} (no altitude) "
+        f"or {GPS_STRUCT_SIZE_WITH_ALTITUDE} (with altitude), got {len(data)} bytes"
     )
-    # Unpack first 33 bytes (actual struct), ignore 3 bytes padding
-    data_to_unpack = data[:33]
-    values = struct.unpack("<IiiiIiiiB", data_to_unpack)
+
+    has_altitude = len(data) == GPS_STRUCT_SIZE_WITH_ALTITUDE
+    if has_altitude:
+        # 37 data bytes (9 int32 + 1 uint8) + 3 padding
+        values = struct.unpack("<IiiiIiiiiB", data[:37])
+        altitude_msl_mm = values[8]
+        fix_type = values[9]
+    else:
+        # 33 data bytes + 3 padding
+        values = struct.unpack("<IiiiIiiiB", data[:33])
+        altitude_msl_mm = 0
+        fix_type = values[8]
 
     micros_reading = values[0]
     latitude = values[1]
@@ -792,7 +862,6 @@ def parse_gnss_entry(data: bytes) -> GNSSReading:
     ned_vel_north = values[5]
     ned_vel_east = values[6]
     ned_vel_down = values[7]
-    fix_type = values[8]
 
     # Convert to physical units
     latitude_dd = latitude / 1e7
@@ -800,6 +869,7 @@ def parse_gnss_entry(data: bytes) -> GNSSReading:
     ned_vel_north_mmps = ned_vel_north
     ned_vel_east_mmps = ned_vel_east
     ned_vel_down_mmps = ned_vel_down
+    altitude_msl_m = altitude_msl_mm / 1000.0
 
     # Create datetime with microsecond accuracy
     datetime_utc = datetime.fromtimestamp(
@@ -822,6 +892,8 @@ def parse_gnss_entry(data: bytes) -> GNSSReading:
         ned_vel_east_mmps=ned_vel_east_mmps,
         ned_vel_down_mmps=ned_vel_down_mmps,
         datetime_utc=datetime_utc,
+        altitude_msl_mm=altitude_msl_mm,
+        altitude_msl_m=altitude_msl_m,
     )
 
 
@@ -829,29 +901,48 @@ def parse_imu_entry(
     data: bytes,
     acc_sensitivity: float = 0.061,
     gyr_sensitivity: float = 4.375,
+    mag_sensitivity: float | None = None,
 ) -> IMUReading:
     """Parse a single IMU entry.
 
     Args:
-        data: Raw binary data for IMU entry
+        data: Raw binary data for IMU entry. Length must be either
+              IMU_STRUCT_SIZE (18, no magnetometer) or
+              IMU_STRUCT_SIZE_WITH_MAG (24, with magnetometer).
         acc_sensitivity: Accelerometer sensitivity in mg/LSB
         gyr_sensitivity: Gyroscope sensitivity in mdps/LSB
+        mag_sensitivity: Magnetometer sensitivity in uT/LSB. Required if
+                         `data` is 24 bytes (with-mag format); ignored if
+                         `data` is 18 bytes (legacy no-mag format).
 
     Returns:
-        IMUReading object with raw and scaled values
+        IMUReading object with raw and scaled values. mag_* fields stay at
+        their default 0 when the legacy 18-byte struct is parsed.
 
     Raises:
-        AssertionError: If data size is incorrect
+        AssertionError: If data size is neither 18 nor 24 bytes.
     """
-    assert len(data) == IMU_STRUCT_SIZE, (
-        f"IMU data size mismatch: expected exactly {IMU_STRUCT_SIZE} bytes, "
-        f"got {len(data)} bytes"
+    assert len(data) in (IMU_STRUCT_SIZE, IMU_STRUCT_SIZE_WITH_MAG), (
+        f"IMU data size mismatch: expected {IMU_STRUCT_SIZE} (no mag) or "
+        f"{IMU_STRUCT_SIZE_WITH_MAG} (with mag) bytes, got {len(data)} bytes"
     )
-    values = struct.unpack("<IHhhhhhh", data[:18])
-    micros_reading = values[0]
-    counter = values[1]
-    acc_x, acc_y, acc_z = values[2], values[3], values[4]
-    gyr_x, gyr_y, gyr_z = values[5], values[6], values[7]
+
+    if len(data) == IMU_STRUCT_SIZE:
+        # Legacy 18-byte struct: micros, counter, 3x acc, 3x gyr
+        values = struct.unpack("<IHhhhhhh", data)
+        micros_reading = values[0]
+        counter = values[1]
+        acc_x, acc_y, acc_z = values[2], values[3], values[4]
+        gyr_x, gyr_y, gyr_z = values[5], values[6], values[7]
+        mag_x = mag_y = mag_z = 0
+    else:
+        # New 24-byte struct: micros, counter, 3x acc, 3x gyr, 3x mag
+        values = struct.unpack("<IHhhhhhhhhh", data)
+        micros_reading = values[0]
+        counter = values[1]
+        acc_x, acc_y, acc_z = values[2], values[3], values[4]
+        gyr_x, gyr_y, gyr_z = values[5], values[6], values[7]
+        mag_x, mag_y, mag_z = values[8], values[9], values[10]
 
     acc_x_mg = acc_x * acc_sensitivity
     acc_y_mg = acc_y * acc_sensitivity
@@ -859,6 +950,13 @@ def parse_imu_entry(
     gyr_x_mdps = gyr_x * gyr_sensitivity
     gyr_y_mdps = gyr_y * gyr_sensitivity
     gyr_z_mdps = gyr_z * gyr_sensitivity
+
+    if mag_sensitivity is None:
+        mag_x_uT = mag_y_uT = mag_z_uT = 0.0
+    else:
+        mag_x_uT = mag_x * mag_sensitivity
+        mag_y_uT = mag_y * mag_sensitivity
+        mag_z_uT = mag_z * mag_sensitivity
 
     return IMUReading(
         micros_reading=micros_reading,
@@ -875,6 +973,12 @@ def parse_imu_entry(
         gyr_x_mdps=gyr_x_mdps,
         gyr_y_mdps=gyr_y_mdps,
         gyr_z_mdps=gyr_z_mdps,
+        mag_x=mag_x,
+        mag_y=mag_y,
+        mag_z=mag_z,
+        mag_x_uT=mag_x_uT,
+        mag_y_uT=mag_y_uT,
+        mag_z_uT=mag_z_uT,
     )
 
 
@@ -1381,12 +1485,13 @@ def process_gnss_entry(
     Returns:
         Tuple of (new_idx, should_break)
     """
-    # Check we have enough bytes
-    line_end = idx + GPS_LINE_SIZE
+    # Check we have enough bytes. gps_struct_size is variable (36 or 40).
+    gps_line_size = MARKER_SIZE + gps_struct_size
+    line_end = idx + gps_line_size
     if line_end > len(content):
         logger.warning(
             f"Incomplete GNSS entry at offset {idx}: "
-            f"need {GPS_LINE_SIZE} bytes, only {len(content) - idx} available"
+            f"need {gps_line_size} bytes, only {len(content) - idx} available"
         )
         logger.error(
             f"File truncated. Parsed {len(pps_list)} PPS, "
@@ -1437,34 +1542,45 @@ def process_imu_entry(
     acc_sensitivity: float,
     gyr_sensitivity: float,
     prev_imu_micros: int | None = None,
+    mag_sensitivity: float | None = None,
 ) -> tuple[int, bool, bool]:
     """Process a single IMU entry.
-    
+
     Args:
+        imu_struct_size: 18 for legacy (no mag) records, 24 for records that
+                         include magnetometer. The on-disk record size is
+                         MARKER_SIZE + imu_struct_size + (2 padding if 18, 0 if 24).
         prev_imu_micros: Previous IMU micros value for jump detection (None if first in segment)
-    
+        mag_sensitivity: Mag sensitivity in uT/LSB if mag is logged (struct=24), else None.
+
     Returns:
         Tuple of (new_idx, should_break, jump_detected)
         - jump_detected: True if a micros jump was detected that should trigger segmentation
     """
+    # Derive on-disk line size from the struct size. The legacy 18-byte struct
+    # has 2 bytes of C alignment padding; the 24-byte mag-included struct is
+    # already 4-aligned so no padding.
+    imu_padding = IMU_PADDING if imu_struct_size == IMU_STRUCT_SIZE else 0
+    imu_line_size = MARKER_SIZE + imu_struct_size + imu_padding
+
     # Check we have enough bytes
-    line_end = idx + IMU_LINE_SIZE
+    line_end = idx + imu_line_size
     if line_end > len(content):
         logger.warning(
             f"Incomplete IMU entry at offset {idx}: "
-            f"need {IMU_LINE_SIZE} bytes, only {len(content) - idx} available"
+            f"need {imu_line_size} bytes, only {len(content) - idx} available"
         )
         logger.error(
             f"File truncated. Parsed {len(pps_list)} PPS, "
             f"{len(gnss_list)} GNSS, {len(imu_list)} IMU entries before truncation"
         )
         return idx, True, False
-    
+
     # Parse entry
     idx += 4
     imu_data = content[idx : idx + imu_struct_size]
     try:
-        imu_entry = parse_imu_entry(imu_data, acc_sensitivity, gyr_sensitivity)
+        imu_entry = parse_imu_entry(imu_data, acc_sensitivity, gyr_sensitivity, mag_sensitivity)
         
         # Check for micros jump if we have previous value
         jump_detected = False
@@ -1494,10 +1610,10 @@ def process_imu_entry(
         logger.error(f"Parsing aborted (data length={len(imu_data)}, expected={imu_struct_size})")
         raise
     idx += imu_struct_size
-    
-    # Skip padding bytes
-    idx += IMU_PADDING
-    
+
+    # Skip padding bytes (2 for legacy 18-byte struct, 0 for 24-byte mag struct).
+    idx += imu_padding
+
     # Check next byte is valid
     if idx < len(content):
         next_byte = content[idx]
@@ -1539,16 +1655,34 @@ def parse_binary_content(
     """
     acc_sensitivity = header_info.get("acc_sensitivity", 0.061)
     gyr_sensitivity = header_info.get("gyr_sensitivity", 4.375)
+    mag_sensitivity = header_info.get("mag_sensitivity")  # None when header has no mag line
     imu_odr = header_info.get("imu_odr", 6667.0)
-    
+
     # Calculate segment size: 1 minute of IMU samples
     n_imus_per_segment = round(imu_odr * 60)
     logger.info(f"Segment size: {n_imus_per_segment} IMU samples (≈1 minute at {imu_odr} Hz)")
     logger.info("Additional segmentation on IMU micros jumps: negative or > 1 second")
-    
+
     pps_struct_size = PPS_STRUCT_SIZE
-    gps_struct_size = GPS_STRUCT_SIZE
-    imu_struct_size = IMU_STRUCT_SIZE
+    # Pick GNSS struct size based on whether the firmware logged altitude.
+    # Detection key: "GNSS includes altitude_msl" header line → 40-byte struct; else legacy 36.
+    if header_info.get("gnss_has_altitude", False):
+        gps_struct_size = GPS_STRUCT_SIZE_WITH_ALTITUDE
+        logger.info("Altitude present in GNSS header — using 40-byte GNSS struct")
+    else:
+        gps_struct_size = GPS_STRUCT_SIZE
+        logger.info("No altitude in GNSS header — using legacy 36-byte GNSS struct")
+    # Pick IMU struct size based on whether the firmware logged the magnetometer.
+    # Detection key: "Mag sensitivity" header line → 24-byte struct; else legacy 18.
+    if mag_sensitivity is not None:
+        imu_struct_size = IMU_STRUCT_SIZE_WITH_MAG
+        logger.info(
+            f"Magnetometer present in header (sensitivity={mag_sensitivity} uT/LSB) — "
+            f"using 24-byte IMU struct"
+        )
+    else:
+        imu_struct_size = IMU_STRUCT_SIZE
+        logger.info("No magnetometer in header — using legacy 18-byte IMU struct")
     
     # Initialize first segment
     segments = []
@@ -1595,7 +1729,7 @@ def parse_binary_content(
                 content, idx, current_segment['pps_list'], current_segment['gnss_list'], current_segment['imu_list'],
                 pps_marker, gps_marker, imu_marker, footer_marker,
                 imu_struct_size, acc_sensitivity, gyr_sensitivity,
-                prev_imu_micros
+                prev_imu_micros, mag_sensitivity
             )
             if should_break:
                 break
@@ -1947,6 +2081,9 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['gnss_vel_north'] = np.array([g.ned_vel_north_mmps for g in gnss_data])
         result['gnss_vel_east'] = np.array([g.ned_vel_east_mmps for g in gnss_data])
         result['gnss_vel_down'] = np.array([g.ned_vel_down_mmps for g in gnss_data])
+        # Altitude above mean sea level (m). 0.0 for recordings from firmware
+        # versions that didn't log altitude — check header['gnss_has_altitude'].
+        result['gnss_altitude_msl'] = np.array([g.altitude_msl_m for g in gnss_data])
         result['gnss_fix_type'] = np.array([g.fix_type for g in gnss_data])
         result['gnss_posix'] = np.array([g.posix_timestamp + g.microseconds * 1e-6 for g in gnss_data])
         result['gnss_utc'] = np.array([
@@ -1959,6 +2096,7 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['gnss_vel_north_outlier'] = np.array([g.ned_vel_north_mmps_stdchecked for g in gnss_data], dtype=bool)
         result['gnss_vel_east_outlier'] = np.array([g.ned_vel_east_mmps_stdchecked for g in gnss_data], dtype=bool)
         result['gnss_vel_down_outlier'] = np.array([g.ned_vel_down_mmps_stdchecked for g in gnss_data], dtype=bool)
+        result['gnss_altitude_msl_outlier'] = np.array([g.altitude_msl_m_stdchecked for g in gnss_data], dtype=bool)
     else:
         result['gnss_micros'] = np.array([])
         result['gnss_micros_unwrapped'] = np.array([])
@@ -1967,6 +2105,7 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['gnss_vel_north'] = np.array([])
         result['gnss_vel_east'] = np.array([])
         result['gnss_vel_down'] = np.array([])
+        result['gnss_altitude_msl'] = np.array([])
         result['gnss_fix_type'] = np.array([])
         result['gnss_posix'] = np.array([])
         result['gnss_utc'] = np.array([])
@@ -1975,6 +2114,7 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['gnss_vel_north_outlier'] = np.array([], dtype=bool)
         result['gnss_vel_east_outlier'] = np.array([], dtype=bool)
         result['gnss_vel_down_outlier'] = np.array([], dtype=bool)
+        result['gnss_altitude_msl_outlier'] = np.array([], dtype=bool)
     
     # Extract IMU arrays
     imu_data = combined['imu']
@@ -1995,6 +2135,10 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['imu_gyr_x'] = np.array([i.gyr_x_mdps for i in imu_data])
         result['imu_gyr_y'] = np.array([i.gyr_y_mdps for i in imu_data])
         result['imu_gyr_z'] = np.array([i.gyr_z_mdps for i in imu_data])
+        # Magnetometer (AK09916). Zero arrays when the firmware didn't log mag.
+        result['imu_mag_x'] = np.array([i.mag_x_uT for i in imu_data])
+        result['imu_mag_y'] = np.array([i.mag_y_uT for i in imu_data])
+        result['imu_mag_z'] = np.array([i.mag_z_uT for i in imu_data])
         result['imu_utc'] = np.array([
             i.utc_timestamp_from_pps_regression if i.utc_timestamp_from_pps_regression is not None else np.nan
             for i in imu_data
@@ -2006,6 +2150,9 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['imu_gyr_x_outlier'] = np.array([i.gyr_x_mdps_stdchecked for i in imu_data], dtype=bool)
         result['imu_gyr_y_outlier'] = np.array([i.gyr_y_mdps_stdchecked for i in imu_data], dtype=bool)
         result['imu_gyr_z_outlier'] = np.array([i.gyr_z_mdps_stdchecked for i in imu_data], dtype=bool)
+        result['imu_mag_x_outlier'] = np.array([i.mag_x_uT_stdchecked for i in imu_data], dtype=bool)
+        result['imu_mag_y_outlier'] = np.array([i.mag_y_uT_stdchecked for i in imu_data], dtype=bool)
+        result['imu_mag_z_outlier'] = np.array([i.mag_z_uT_stdchecked for i in imu_data], dtype=bool)
     else:
         result['imu_micros'] = np.array([])
         result['imu_micros_unwrapped'] = np.array([])
@@ -2017,6 +2164,9 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['imu_gyr_x'] = np.array([])
         result['imu_gyr_y'] = np.array([])
         result['imu_gyr_z'] = np.array([])
+        result['imu_mag_x'] = np.array([])
+        result['imu_mag_y'] = np.array([])
+        result['imu_mag_z'] = np.array([])
         result['imu_utc'] = np.array([])
         result['imu_acc_x_outlier'] = np.array([], dtype=bool)
         result['imu_acc_y_outlier'] = np.array([], dtype=bool)
@@ -2024,6 +2174,9 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['imu_gyr_x_outlier'] = np.array([], dtype=bool)
         result['imu_gyr_y_outlier'] = np.array([], dtype=bool)
         result['imu_gyr_z_outlier'] = np.array([], dtype=bool)
+        result['imu_mag_x_outlier'] = np.array([], dtype=bool)
+        result['imu_mag_y_outlier'] = np.array([], dtype=bool)
+        result['imu_mag_z_outlier'] = np.array([], dtype=bool)
     
     return result
 
@@ -2039,6 +2192,7 @@ def decode_file(
     pps_struct_size: int = PPS_STRUCT_SIZE,
     gps_struct_size: int = GPS_STRUCT_SIZE,
     imu_struct_size: int = IMU_STRUCT_SIZE,
+    allow_no_pps: bool = False,
 ) -> dict[str, Path]:
     """Decode a single data file and save to compressed numpy archive with segments.
 
@@ -2368,13 +2522,13 @@ def decode_file(
         # - Multiple segments (single segment files are kept even with bad regression)
         should_filter_regression = has_any_gnss and has_bad_regression and pps_count >= 2 and has_multiple_segments
         
-        if should_filter_small and (pps_count < 2 or gnss_count < 1):
+        if should_filter_small and (pps_count < 2 or gnss_count < 1) and not allow_no_pps:
             skipped_segments.append(seg_idx)
             logger.warning(
                 f"Skipping segment {seg_idx} (insufficient for GPS sync): "
                 f"{pps_count} PPS, {gnss_count} GNSS, {imu_count} IMU entries"
             )
-        elif should_filter_regression:
+        elif should_filter_regression and not allow_no_pps:
             bad_regression_segments.append(seg_idx)
             logger.warning(
                 f"Skipping segment {seg_idx} (poor GPS sync quality): "

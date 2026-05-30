@@ -1,9 +1,18 @@
-"""Example script demonstrating how to decode a data file."""
+"""Example script demonstrating how to decode a data file.
+
+Usage:
+    python example_decode.py [path/to/file.dat]
+
+If no path is given, the script picks the first DATA_BOOT_*.dat file in the
+current directory.
+
+This example shows the dataclass-based loading workflow. For the simpler
+numpy-array workflow see simple_example.py.
+"""
 
 import sys
 from pathlib import Path
 
-import numpy as np
 from loguru import logger
 
 from decoder import decode_file, load_and_combine_segments
@@ -11,7 +20,7 @@ from decoder import decode_file, load_and_combine_segments
 
 def print_data_sample(data, data_type: str, n: int = 10) -> None:
     """Print first n and last n entries of data array.
-    
+
     Args:
         data: Numpy array of data entries
         data_type: Type name for logging (e.g., "PPS", "GNSS", "IMU")
@@ -41,16 +50,35 @@ def print_data_sample(data, data_type: str, n: int = 10) -> None:
             logger.info(f"  [{i}] {data[i]}")
 
 
+def find_default_data_file() -> Path | None:
+    """Pick the first DATA_BOOT_*.dat file in the script directory."""
+    here = Path(__file__).parent
+    candidates = sorted(here.glob("DATA_BOOT_*.dat"))
+    return candidates[0] if candidates else None
+
+
 if __name__ == "__main__":
-    data_file = Path("DATA_BOOT_0000_TIME_20260204T193000.dat")
+    if len(sys.argv) > 1:
+        data_file = Path(sys.argv[1])
+    else:
+        data_file = find_default_data_file()
+        if data_file is None:
+            logger.error(
+                "No data file given and no DATA_BOOT_*.dat found in the script directory. "
+                "Usage: python example_decode.py [path/to/file.dat]"
+            )
+            sys.exit(1)
+        logger.info(f"No path argument given, auto-selected: {data_file.name}")
 
     if not data_file.exists():
         logger.error(f"Data file not found: {data_file}")
         sys.exit(1)
 
     logger.info(f"Decoding data file: {data_file}")
-    # To enable ASCII plots, set show_plots=True
-    output_files = decode_file(data_file, show_plots=False)
+    # allow_no_pps=True so indoor / debug recordings (no GPS lock) still decode.
+    # When the PPS hardware line is wired and a fix is acquired, you can leave
+    # this off to get microsecond-accurate UTC timestamps via PPS regression.
+    output_files = decode_file(data_file, show_plots=False, allow_no_pps=True)
 
     logger.info("")
     logger.info("=" * 80)
@@ -60,14 +88,14 @@ if __name__ == "__main__":
     # Load and combine all segments using helper function
     npz_file = output_files["file"]
     combined_data = load_and_combine_segments(npz_file)
-    
+
     pps_data = combined_data["pps"]
     gnss_data = combined_data["gnss"]
     imu_data = combined_data["imu"]
     n_segments = combined_data["number_of_segments"]
-    
+
     logger.info(f"Loaded data from {n_segments} segments")
-    
+
     # Display header information
     logger.info("")
     logger.info("=" * 80)
@@ -79,6 +107,10 @@ if __name__ == "__main__":
         logger.info(f"Acc sensitivity: {combined_data['acc_sensitivity'][0]} mg/LSB")
     if "gyr_sensitivity" in combined_data:
         logger.info(f"Gyr sensitivity: {combined_data['gyr_sensitivity'][0]} mdps/LSB")
+    if "mag_sensitivity" in combined_data:
+        logger.info(f"Mag sensitivity: {combined_data['mag_sensitivity'][0]} uT/LSB (ICM-20948 AK09916)")
+    else:
+        logger.info("Mag sensitivity: N/A (firmware did not log magnetometer)")
     if "imu_odr" in combined_data:
         logger.info(f"IMU ODR: {combined_data['imu_odr'][0]} Hz")
     if "gnss_rate" in combined_data:
