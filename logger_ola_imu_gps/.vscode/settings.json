@@ -2,5 +2,6 @@
     "cSpell.words": [
         "crrt",
         "DHCX"
-    ]
+    ],
+    "python.defaultInterpreterPath": "C:\\anaconda3\\envs\\py311test\\python.exe"
 }

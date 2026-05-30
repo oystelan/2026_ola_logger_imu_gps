@@ -1,135 +1,190 @@
 # OLA Waves Logger (OWL)
 
-## Hardware and assembly / connections
+A high-rate, low-jitter inertial + GNSS data logger built around the **SparkFun OpenLog Artemis (OLA)**, using its built-in ICM-20948 9-DoF IMU and a u-blox GNSS receiver on QWIIC. Designed primarily for wave-buoy / motion-sensing work but works as a general-purpose IMU+GNSS logger.
 
-This is the code for a data logger using the following components:
+## Hardware
 
-- main board: SF OLA (Sparkfun OpenLogArtemis) without built-in IMU: https://www.sparkfun.com/sparkfun-openlog-artemis-without-imu.html 
-- ISM330DHCX over qwiic IMU (for example, the Sparkfun one): https://www.sparkfun.com/sparkfun-6dof-imu-breakout-ism330dhcx-qwiic.html 
-- SAM-M10Q over qwiic + PPS interrupt (connect PPS GPS pin to pin 11 OLA) (for example, the Sparkfun one): https://www.sparkfun.com/sparkfun-gps-breakout-chip-antenna-sam-m10q-qwiic.html
-- 2 x qwiic cables to connect OLA <-> IMU <-> GPS: https://www.sparkfun.com/flexible-qwiic-cable-50mm.html or similar, depending on your layout / design
+### Required
 
-I recommend going OLA <-> ISM330DHCX breakout <-> GPS breakout, and keep wires relatively short. The I2C bus is run at 400kHz.
+- **Main board:** [SparkFun OpenLog Artemis](https://www.sparkfun.com/openlog-artemis) — the *with-IMU* variant. The on-board ICM-20948 (3-axis accel + 3-axis gyro + AK09916 magnetometer) is wired to the Artemis over SPI and is the primary inertial sensor.
 
-In addition, users may want to design a robust power supply, such as:
+### Optional but recommended
 
-- option 1: non rechargeable batteries
-  - batteries: SAFT LSH20 or similar to be power effective in cold conditions, or usual alcaline batteries in normal conditions; design your power pack to provide around 3.6-4.5V
-  - regulator: Pololu step up / step down to ensure stable 3.3V supply: https://www.pololu.com/product/2122
-  - connect the 3.3V regulated power to the 3V3 OLA pin
-  - connect the GND regulated power to the GND OLA pin
+- **GNSS receiver on QWIIC** — any u-blox module that speaks the standard u-blox UBX protocol over I2C. We use the **u-blox MAX-M10S** but any of the MAX-M10S / SAM-M10Q / NEO-M9N family works. Connect the module's PPS pin to **OLA pin 11** if you want sub-sample-period UTC timestamps for the IMU samples.
+- **VBAT coin cell (CR1225)** — keeps the Apollo3's hardware RTC alive across power-off so UTC timestamps survive reboots even without a GNSS fix. See [Time keeping](#time-keeping-utc-across-power-cycles) below.
+- **QWIIC cable** between OLA QWIIC port and GNSS module.
 
-- option 2: rechargeable batteries, SF system
-  - the OLA is compatible out of the box with for example https://www.sparkfun.com/lithium-ion-battery-2ah.html (comes in many different capacities)
-  - also buy a charger: https://www.sparkfun.com/sparkfun-lipo-charger-plus.html or similar
-  - this can be directly plugged to the OLA on the right connector
+The firmware **detects at boot** whether a GNSS module is present. If yes, it waits for a valid fix before starting to log. If no, it starts logging immediately with the best available time source — see [Runtime GNSS detection](#runtime-gnss-detection).
 
-In order to reach lowest possible power consumption, users may consider to cut the power LED pads on the back of boards that support it (such as the Sparkfun GPS and IMU breakout boards).
+### Power supply options
 
-Use a good quality SD card to enable power efficient and fast logging. The SD card needs to be formatted as FAT before use. When formatting the card, use the "overwrite" option to make sure it is filled with `\0` bytes, since the files are pre-allocated so this may make it easier to find file end in case the full file length is not used. The choice of the SD card has a lot to say for performance and power use, and it is difficult to know in advance what cards are good for such small continuous writes - it may be worth testing a bit with different models before ordering a batch!
+Two reasonable approaches:
+
+- **Non-rechargeable batteries.** SAFT LSH20 are good in cold conditions; alkaline cells in normal conditions. Design the pack for 3.6–4.5 V, then use a [Pololu step-up/step-down regulator](https://www.pololu.com/product/2122) to feed clean 3.3 V to the OLA's 3V3 pin (and GND to GND).
+- **Rechargeable LiPo.** The OLA accepts SparkFun's [LiPo cells](https://www.sparkfun.com/lithium-ion-battery-2ah.html) directly on the JST connector. Pair with a [LiPo charger](https://www.sparkfun.com/sparkfun-lipo-charger-plus.html).
+
+To minimise standby current, cut the power LED pads on the back of any breakout boards that have them.
+
+### SD card
+
+Use a good-quality SD card formatted as FAT. When formatting, use the **overwrite** option so the card is filled with `\0` — this matters because the firmware pre-allocates each log file at fixed size, and `\0` makes it trivial to find the actual end-of-data later. SD card choice has a big impact on both power consumption and write throughput — worth testing a few models before committing to a batch.
 
 ## PCB
 
-We provide a PCB for a standard OLA logger, with capacity for 3 LSH20 batteries. TODO: release when ready.
+A PCB design for an OLA-based logger with capacity for 3 × LSH20 batteries is in the `pcb/` folder (production gerbers included).
 
-## Notes about the design
+## IMU axis convention
 
-The aim is to have a robust, high accuracy, high frequency, low jitter logger.
+The ICM-20948 die inside the OLA package is rotated relative to the PCB silkscreen arrows, and *the accel and gyro dies inside the chip are at different orientations to each other*. The firmware applies a chip→PCB body-frame remap so the output channels match the PCB silkscreen arrows in both magnitude and sign:
 
-The ISM330DHCX (MEMS 3-axis accelerometer + 3-axis gyroscope) is logged through a timer driven interrupt routine and deque buffers at 417Hz by default. This ensures that the data are gathered reliably even when the CPU is busy with async tasks (e.g. writing to SD card). The IMU is set up to work at the highest possible accuracy level.
+| Axis | Accel mapping | Gyro mapping |
+|---|---|---|
+| `PCB_x` | `chip_z` | `chip_x` |
+| `PCB_y` | `chip_x` | `chip_y` |
+| `PCB_z` | `chip_y` | `chip_z` |
 
-The GPS is logged through the same timer driven interrupt at 10Hz by default.
+Net effect for the user:
 
-The UTC PPS seconds starts are logged through a rising edge interrupt acquired from the GPS PPS pin.
+- **Accel:** point any silkscreen arrow downward (toward gravity) → that channel reads **−1 g**. (Specific-force convention: arrow up reads +1 g.)
+- **Gyro:** rotate about any silkscreen axis using the right-hand rule → that channel reads **positive**.
+- **Mag:** logged as raw chip-frame output. The AK09916 die's orientation relative to the PCB has not been verified yet; **do a compass-bearing test before relying on yaw**.
 
-Writing to SD cards is performed asynchronously through a busy loop.
+If you replace the OLA with a different unit and the values look swapped, the chip-to-PCB orientation may differ — re-derive the mapping by laying the PCB flat in each of the 6 stable poses and noting which channel reads ±1 g.
 
-The full sketch is under watchdog timer control, so the board will hard reboot in case of an issue.
+## Calibration
 
-With this design, all the sensors logging is done through interrupts and buffered to deques, and all SD card writing is done asynchronously from the logging through a busy loop - this should result in reliable low jitter logging.
+The hardware RESET button doubles as a calibration trigger. Each press reboots the chip; consecutive presses inside a ~2.5 s window are detected via a decision-pending flag in EEPROM:
 
-The power consumption is around XXmA (may depend on SD card used, satellite signal quality).
+| Presses | Action |
+|---|---|
+| 1 (normal) | Boot normally; load stored biases from EEPROM |
+| **2** | **Tier 1: gyro bias calibration** — keep the device perfectly still for 5 s after the second press. The firmware averages gyro readings over 5 s, stores the bias in EEPROM, and from then on subtracts it from every logged sample. Survives power loss. |
+| **3** | Tier 2: magnetometer hard-iron calibration (reserved; not yet implemented) |
 
-The amount of data generated is 1 file every 15 minutes, typical file size around XX KBytes.
+The STAT LED blinks during the decision window — faster blinks mean a higher press count has been registered, giving you live feedback that the multi-press is being detected.
 
-## LED understanding
+## Time keeping (UTC across power-cycles)
 
-The red LED may blink during setup.
+The firmware seeds its software POSIX-time counter at boot from the **first available** of:
 
-The blue LED should blink / possibly flicker during logging (it is on while busy writing to SD, off when no ongoing SD writing).
+1. **Apollo3 hardware RTC** (battery-backed by the VBAT coin cell). The H/W RTC's date/time registers are written every time the firmware receives a GNSS fix and keep counting on their own from the 32.768 kHz XT crystal across power-off. Drift is ~±20 ppm → ~1.7 s/day. On boot the H/W RTC is read and the value is accepted if year ≥ 2025.
+2. **EEPROM-stored last-known UTC** (only if `ENABLE_TIME_EEPROM_FALLBACK` is set in `firmware_configuration.h`, default on). Saved at every 15-minute file rotation. Less accurate than the H/W RTC (only as fresh as the last save) but recovers something useful on a board without a coin cell.
+3. Fall through to **0** (1970 epoch) — same as before. Will get overridden once GNSS locks.
 
-The PPS LED should blink at 1Hz when GPS signal is available.
+After the seed, whenever a GNSS fix arrives, the firmware:
+- Writes the GNSS UTC to **both** the software counter and the H/W RTC date/time registers.
+- **Compares** the GNSS UTC to the pre-sync software counter (only if the seed had come from the H/W RTC). If `|delta| > 1 s`, the next two GNSS entries written to the data file are tagged with `posix_timestamp = 0` — a **visible 1970-spike marker** in the data file that immediately shows when re-syncing happened and that the previous timestamps in this file are likely off.
 
-The logger only logs if it gets GPS information - if no GPS information within 5 minutes, it will go to sleep for 1 hour to save battery before trying again. Press the reset button if you want to force restart the firmware.
+The threshold and marker length are constants in `main.cpp`; change them if you want a different sensitivity or visibility.
+
+## Runtime GNSS detection
+
+`log_GNSS.begin()` is attempted at every setup attempt. The runtime outcome controls the rest of boot:
+
+- **GNSS responds** → `g_gnss_present = true`. If `ENABLE_GNSS_START` is also true (default), the firmware waits up to 2 minutes for a valid fix before starting to sample. Subsequent loops capture PVT at 10 Hz and PPS via external-interrupt ISR.
+- **GNSS does not respond** → `g_gnss_present = false`. The firmware proceeds **without GNSS**, using the H/W-RTC or EEPROM-seeded UTC for timestamps. The GNSS-read and PPS code paths in the ISR are gated off so no I2C cycles are wasted polling a non-existent device.
+
+In other words: plug in a GNSS to wait for satellite time; leave it unplugged for indoor / quick-test work and the firmware uses persistent UTC instead.
+
+## Sampling architecture
+
+The aim is a robust, high-accuracy, high-frequency, low-jitter logger.
+
+- **IMU at 225 Hz** over SPI (4 MHz) via a CTIMER-driven ISR. ACCEL samples are buffered in the ICM-20948's on-board FIFO (4 KB ≈ 1.5 s of headroom at 225 Hz) so that SD-card write blocking (typically up to ~700 ms per stall) doesn't drop samples. The ISR drains the FIFO into a ring-buffer deque whenever it gets a chance. Gyro and mag are read once per ISR call via `getAGMT()` and stamped onto each FIFO sample.
+- **GNSS PVT at 10 Hz** over QWIIC I2C (400 kHz), captured by the same CTIMER ISR.
+- **PPS rising edge** captured by an external-interrupt ISR on pin 11.
+- **SD-card writes** run asynchronously in a busy loop in the main thread, draining the IMU/GNSS/PPS deques. The watchdog covers the whole sketch and will hard-reboot the board if anything stalls long enough.
+- **New file every 15 minutes** of UTC. Files are pre-allocated to ~12 MB.
+
+## Data files
+
+Binary `.dat` files on the SD card. Each boot creates a folder `BOOT_NNNNNN/` containing `.dat` files named with the UTC start time, e.g. `BOOT_000349/DATA_BOOT_000349_TIME_20260530T134500.dat`.
+
+See the [decoder/](decoder/) folder for:
+
+- `decoder.py` — binary `.dat` parser, segment splitter, outlier detection
+- `ahrs_vertical.py` — three vertical-motion estimators on the IMU stream (Madgwick AHRS, complementary filter, savgol-detrend) followed by FFT band-pass double integration to displacement
+- `sensor_fusion.py` — 15-state error-state EKF that loosely fuses IMU + GNSS + magnetometer for full 6-DoF position/velocity/attitude
+- `ahrs_example.py`, `ekf_fusion_example.py`, `plot_raw_accel.py` — usage examples and plotting utilities
+
+## LED indicators
+
+| LED | Meaning |
+|---|---|
+| STAT (blue) | Blinks during boot setup. During the calibration decision window after RESET it blinks at a rate that scales with the press count. During logging, on while writing to SD, off otherwise (so usually flickers). |
+| PWR (red) | Steady when powered. Optional startup-blink pattern controlled by `ENABLE_BLINK_PWR_LED`. |
+| PPS | Blinks at 1 Hz when the GNSS has a fix. |
 
 ## Compiling / Uploading
 
-The project uses the Sparkfun Artemis Arduino core v1, made available through the PlatformIO platform: see instructions at: https://github.com/nigelb/platform-apollo3blue . Make sure to choose Core V1. All dependencies are hard copied in the lib folder.
+The project uses the SparkFun Artemis Arduino core v1 via PlatformIO: see [github.com/nigelb/platform-apollo3blue](https://github.com/nigelb/platform-apollo3blue). Make sure to choose **Core V1**. All dependencies are vendored in the `lib/` folder.
 
-In addition we provide .bin files (for different firmware flavor, see naming), that have been compiled in advance and can be uploaded directly to the OLA using: https://github.com/sparkfun/Artemis-Firmware-Upload-GUI .
+Build + flash:
+```
+pio run -t upload
+```
 
-## Data extraction from files
+Pre-built `.bin` files (when provided) can also be flashed directly via the [Artemis Firmware Upload GUI](https://github.com/sparkfun/Artemis-Firmware-Upload-GUI).
 
-The data on the SD card are stored largely in binary format for efficiency (otherwise, the bandwidth to be written to SD card would be too large, and the SD card would also fill too fast). See the decoder in the adjacent folder to extract the data from the SD card.
+## Configuration knobs
 
-## Choice of SD card
+Most user-relevant constants live in:
 
-SD cards come in many different qualities, and speed and power consumption can vary a lot. Choose a "reasonably good" one, otherwise power consumption may be bad and / or writing speed too slow compared to the data stream. Choosing a good SD card is a dark art, you may need to test with different models!
+- `firmware_configuration.h` — `ENABLE_TIME_EEPROM_FALLBACK`, pin assignments, baudrates
+- top of `main.cpp` — `ENABLE_GNSS`, `ENABLE_GNSS_START`, `ENABLE_BLINK_PWR_LED`, IMU sample rate (`IMU_ODR_HZ` + `IMU_SMPLRT_DIV`), GNSS update rate (`GNSS_FREQUENCY_HZ`)
 
 ## Disclaimers
 
-I wanted to make this into a "clean" project, but I ended up time constrained, so this is a mix of old libs, new libs, custom libs, and various stuff I had from other projects around the years - this is a bit messy!
+This started as a clean project and ended up as a mix of old libs, new libs, custom libs, and assorted code accumulated from years of related work. There are corners that are still messy.
 
 ## Serial logs
 
-When running the logger while connect to USB, some level of information / log is provided over USB (serial baudrate 1 million: 1000000). For example:
+At baudrate 1000000 over USB, the logger prints status during boot and periodic rate/deque summaries during logging. A typical session looks something like:
 
 ```
-millis(): 1539116; seconds since boot: 1539
-Samples logged in last interval: IMU: 4443; GNSS: 95; PPS: 8
-Max deque sizes reached: IMU: 21 over 12510; ISM FIFO: 12 over 512; GNSS: 1 over 300; PPS: 1 over 30
-Effective logging rates (Hz): IMU (Hz): 444.20; GNSS (Hz): 9.50; PPS (Hz): 0.80
-Accumulated SD time (ms): 4810 ms over 10000 ms interval
+=== GYRO CALIBRATION ===  (only if RESET was double-pressed)
+Keep the device PERFECTLY STILL for 5 seconds...
+...
 
-millis(): 1549127; seconds since boot: 1549
-Samples logged in last interval: IMU: 4432; GNSS: 96; PPS: 9
-Max deque sizes reached: IMU: 20 over 12510; ISM FIFO: 10 over 512; GNSS: 1 over 300; PPS: 1 over 30
-Effective logging rates (Hz): IMU (Hz): 443.10; GNSS (Hz): 9.60; PPS (Hz): 0.90
-Accumulated SD time (ms): 4822 ms over 10000 ms interval
+RTC seeded from H/W RTC (battery-backed): 1748640000
+- TimeManager -
+posix_is_set = true
+posix_timestamp: 1748640000
+gregorian: 2026-05-31T00:00:00Z
 
-Time to start new log file
-Final log file size (KBytes): 10240
-Final log file available size remaining (KBytes): 2147
-Syncing and closing file...
-File closed
-
+Setup attempt #: 1
+Starting I2C QWIIC...
+I2C QWIIC started
+success starting GNSS
+GNSS set to UBX output
+Current update rate: 10
+Waiting for GNSS fix...
+..........
+GNSS fix acquired.
+GNSS vs H/W-RTC drift = 0 s — within tolerance, no marker
+GNSS setup complete.
+...
 Preparing to start new log file...
-Opening file: DATA_BOOT_0058_TIME_20260120T220000.dat
+Opening file: DATA_BOOT_000350_TIME_20260530T134500.dat
 File opened successfully
-Preallocating 10485760 bytes...
+Preallocating 12582912 bytes...
 File preallocated successfully
-Log file opened and preallocated successfully.
-Current posix timestamp: 1768946402
-Next log file posix timestamp: 1768947300
+Current posix timestamp: 1748641500
+Next log file posix timestamp: 1748642400
 Logging...
 
-Log start OLA ISM330DHCX SAM-M10Q logger
-
-Firmware commit ID: f46f8cf748345997a2077f094a2bc248dbabcaa5
-ISM330DHCX Acc sensitivity (mg/LSB): 0.061000
-ISM330DHCX Gyr sensitivity (mdps/LSB): 4.375000
-ISM330DHCX ODR (Hz): 417.00
-GNSS update rate (Hz): 10
-
-millis(): 1563287; seconds since boot: 1563
-Samples logged in last interval: IMU: 4433; GNSS: 93; PPS: 10
-Max deque sizes reached: IMU: 1255 over 12510; ISM FIFO: 10 over 512; GNSS: 27 over 300; PPS: 2 over 30
-Effective logging rates (Hz): IMU (Hz): 443.20; GNSS (Hz): 9.30; PPS (Hz): 1.00
-Accumulated SD time (ms): 6406 ms over 10000 ms interval
-
-millis(): 1573308; seconds since boot: 1573
-Samples logged in last interval: IMU: 4437; GNSS: 96; PPS: 10
-Max deque sizes reached: IMU: 19 over 12510; ISM FIFO: 10 over 512; GNSS: 1 over 300; PPS: 1 over 30
-Effective logging rates (Hz): IMU (Hz): 443.50; GNSS (Hz): 9.60; PPS (Hz): 1.00
-Accumulated SD time (ms): 4885 ms over 10000 ms interval
+millis(): 15039; seconds since boot: 15
+Samples logged in last interval: IMU: 2247; GNSS: 95; PPS: 8
+Max deque sizes reached: IMU: 21 over 4500; FIFO: 12 over 4096; GNSS: 1 over 200; PPS: 1 over 20
+Effective logging rates (Hz): IMU: 224.70; GNSS: 9.50; PPS: 0.80
+Accumulated SD time (ms): 4810 ms over 10000 ms interval
 ```
+
+If no GNSS is detected, the GNSS-related lines are replaced by:
+
+```
+No GNSS module detected on QWIIC — proceeding without GNSS;
+timestamps will use the persistent RTC seed (H/W RTC or EEPROM).
+```
+
+and the firmware proceeds straight to IMU + SD setup.
