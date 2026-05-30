@@ -43,6 +43,26 @@ class TimeManager{
     // seconds in an interrupt-driven way
     void setup_RTC(void);
 
+    // Read the battery-backed Apollo3 hardware RTC date/time registers and
+    // convert to a POSIX timestamp. Returns 0 if the H/W RTC value is
+    // implausible (year < 2025) — i.e. it's the post-power-loss default,
+    // not a value we previously wrote. With a coin cell on VBAT the H/W
+    // RTC keeps counting through power-off; this is how we recover that
+    // counter on the next boot.
+    kiss_time_t read_hw_rtc_posix(void) const;
+
+    // Write the given POSIX timestamp into the H/W RTC date/time registers.
+    // Call this whenever we receive an authoritative time source (e.g. GNSS
+    // UTC) so the H/W RTC remains battery-backed and accurate across power
+    // cycles. Does NOT update the software `posix_timestamp` counter — caller
+    // should also call set_posix_timestamp().
+    void write_hw_rtc_posix(kiss_time_t crrt_posix_timestamp);
+
+    // Minimum POSIX-derived year considered "plausibly initialised" by
+    // read_hw_rtc_posix(). Used to distinguish a battery-preserved RTC value
+    // from the chip's post-power-loss default (often 2000-01-01).
+    static constexpr int RTC_SANITY_YEAR_MIN = 2025;
+
   private:
     // have we ever set a posix timestamp?
     bool posix_is_set;

@@ -112,6 +112,58 @@ void TimeManager::print_status(void) const
 //--------------------------------------------------------------------------------
 // low level control: RTC setup and 1 second interrupt
 
+// Read the battery-backed H/W RTC date/time registers and convert to POSIX.
+// Returns 0 if the H/W RTC clearly hasn't been initialised (year < sanity min).
+kiss_time_t TimeManager::read_hw_rtc_posix(void) const
+{
+    am_hal_rtc_time_t hw_time;
+    am_hal_rtc_time_get(&hw_time);
+
+    // Apollo3 century convention: 0 = 2000-2099, 1 = 1900-1999.
+    int const full_year = (hw_time.ui32Century == 0 ? 2000 : 1900)
+                          + static_cast<int>(hw_time.ui32Year);
+
+    if (full_year < RTC_SANITY_YEAR_MIN) {
+        return 0;
+    }
+
+    // posix_timestamp_from_YMDHMS reuses a shared global; OK here since we're
+    // single-threaded during boot/sync.
+    time_t const posix = posix_timestamp_from_YMDHMS(
+        full_year,
+        static_cast<int>(hw_time.ui32Month),
+        static_cast<int>(hw_time.ui32DayOfMonth),
+        static_cast<int>(hw_time.ui32Hour),
+        static_cast<int>(hw_time.ui32Minute),
+        static_cast<int>(hw_time.ui32Second)
+    );
+    return static_cast<kiss_time_t>(posix);
+}
+
+// Write a POSIX timestamp into the battery-backed H/W RTC registers.
+void TimeManager::write_hw_rtc_posix(kiss_time_t crrt_posix_timestamp)
+{
+    auto const ymdhms = YMDHMS_from_posix_timestamp(
+        static_cast<time_t>(crrt_posix_timestamp)
+    );
+
+    am_hal_rtc_time_t hw_time{};
+    hw_time.ui32CenturyEnable = 1;
+    hw_time.ui32Century = (ymdhms.year >= 2000) ? 0u : 1u;
+    hw_time.ui32Year = static_cast<uint32_t>(
+        (ymdhms.year >= 2000) ? (ymdhms.year - 2000) : (ymdhms.year - 1900)
+    );
+    hw_time.ui32Month = static_cast<uint32_t>(ymdhms.month);
+    hw_time.ui32DayOfMonth = static_cast<uint32_t>(ymdhms.day);
+    hw_time.ui32Hour = static_cast<uint32_t>(ymdhms.hour);
+    hw_time.ui32Minute = static_cast<uint32_t>(ymdhms.minute);
+    hw_time.ui32Second = static_cast<uint32_t>(ymdhms.second);
+    hw_time.ui32Hundredths = 0;
+    hw_time.ui32Weekday = 0;  // we don't track weekday — RTC computes it
+
+    am_hal_rtc_time_set(&hw_time);
+}
+
 // Set up the RTC to generate interrupts every second
 void TimeManager::setup_RTC(void)
 {
