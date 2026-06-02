@@ -26,9 +26,10 @@ This script wraps the protocol with a friendly interactive prompt:
 
 For non-interactive use, pass --file-index N (or --all) and --output-dir.
 
-Defaults to 1 Mbaud — bump --baud (e.g. to 2000000 or 3000000) once you've
-confirmed the basic transfer works, since CDC over USB on Apollo3 will
-happily exceed the requested rate.
+Defaults to 1 Mbaud. The OLA's USB connection is bridged by a CH340, which
+makes --baud a real UART line rate — must match the firmware constant
+BAUD_RATE_USB. 1 Mbaud is the empirically tested-reliable rate on this
+hardware; higher rates lose bytes through the CH340 + host driver.
 """
 
 from __future__ import annotations
@@ -287,9 +288,12 @@ def main() -> int:
     ap.add_argument("--port", required=True,
                     help="Serial port the OLA is on (e.g. COM5 or /dev/ttyACM0)")
     ap.add_argument("--baud", type=int, default=1_000_000,
-                    help="Baud rate (default 1000000). The firmware accepts most rates "
-                         "since USB CDC ignores it, but Windows USB stacks can drop bytes "
-                         "above ~1 Mbaud — start safe, crank up after verifying.")
+                    help="Baud rate (default 1000000). On the OLA the USB connection "
+                         "goes through a CH340 chip, so this is a real UART line rate "
+                         "and must match the firmware's BAUD_RATE_USB. 1 Mbaud is the "
+                         "tested-reliable rate on this hardware; pushing higher requires "
+                         "both the firmware constant AND this default to be bumped, AND "
+                         "the CH340 + host driver to agree.")
     ap.add_argument("--output-dir", type=Path, default=Path("."),
                     help="Where to save downloaded files (default: current dir)")
     ap.add_argument("--file-index", type=int, default=None,
@@ -301,21 +305,99 @@ def main() -> int:
                          "reboots back into normal logging mode.")
     args = ap.parse_args()
 
-    print(f"Opening {args.port} at {args.baud} baud...")
-    with serial.Serial(args.port, baudrate=args.baud, timeout=0.1) as ser:
-        # On Windows the port is sometimes "fresh" on open; let any banner
-        # the device printed before we connected drain.
+    print(f"Opening {args.port} at {args.baud} baud (DTR/RTS held LOW)...")
+    # CRITICAL background: the OLA's USB connection goes through a CH340-style
+    # USB-serial chip whose DTR pin is capacitively coupled to NRST. On
+    # Windows, port enumeration toggles DTR briefly during open() *regardless*
+    # of what pyserial sets — the OS-level driver does it before pyserial even
+    # gets the handle. Setting dtr/rts LOW before open() reduces (but doesn't
+    # always eliminate) the pulse.
+    #
+    # The robust workflow is therefore: open the port FIRST (accept that the
+    # device may reboot once), then have the user enter file-transfer mode by
+    # double-pressing RESET *after* we're connected. Once the port is held
+    # open with DTR LOW, no further reset edges are generated and the device
+    # stays in whatever mode it boots into.
+    ser = serial.Serial()
+    ser.port = args.port
+    ser.baudrate = args.baud
+    ser.timeout = 0.1
+    ser.dtr = False
+    ser.rts = False
+    try:
+        ser.open()
+    except serial.SerialException as e:
+        print(f"ERROR: could not open {args.port}: {e}")
+        return 1
+    with ser:
+        # Re-assert LOW after open in case the platform's driver clobbered it.
+        ser.dtr = False
+        ser.rts = False
+
+        # Host-handshake protocol (no manual RESET press required):
+        # The CH340 USB-serial chip on the OLA toggles DTR briefly when the
+        # host opens the port (Windows always; some Linux distros too),
+        # which capacitively couples through to NRST and reboots the
+        # Apollo3. By the time we get here, the device is either rebooting
+        # or partway through setup() — and the firmware will scan its
+        # serial RX buffer for "OLA_ENTER_TRANSFER\n" after the multi-press
+        # detection window. We spam that token at ~3 Hz during the boot
+        # window so whatever bytes the CDC buffer manages to capture
+        # contain the magic string. The firmware accepts and answers with
+        # the file-transfer banner.
+        print("Sending handshake (OLA_ENTER_TRANSFER spam) — waiting for OLA to enter "
+              "file-transfer mode...")
+        deadline = time.monotonic() + 20.0
+        last_send = 0.0
+        buf = bytearray()
+        seen = False
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now - last_send >= 0.3:
+                ser.write(b"OLA_ENTER_TRANSFER\n")
+                ser.flush()
+                last_send = now
+            chunk = ser.read(256)
+            if chunk:
+                buf.extend(chunk)
+                if b"FILE TRANSFER MODE" in buf or b"HANDSHAKE ACCEPTED" in buf:
+                    seen = True
+                    # Drain to next READY so we're synchronised.
+                    try:
+                        wait_for_ready(ser, timeout_s=8.0)
+                    except TimeoutError:
+                        pass
+                    break
+        if not seen:
+            print()
+            print("WARNING: did not see the file-transfer banner from the handshake.")
+            print("Fallback: tap the RESET button on the OLA TWICE within ~2 s now.")
+            print("(LED should start a slow cosine pulse.)")
+            print("Waiting up to 60 s for the file-transfer banner...")
+            deadline2 = time.monotonic() + 60.0
+            while time.monotonic() < deadline2:
+                chunk = ser.read(256)
+                if chunk:
+                    buf.extend(chunk)
+                    if b"FILE TRANSFER MODE" in buf:
+                        seen = True
+                        try:
+                            wait_for_ready(ser, timeout_s=5.0)
+                        except TimeoutError:
+                            pass
+                        break
+            if not seen:
+                print("ERROR: device never entered file-transfer mode. Reset the OLA "
+                      "and try again.")
+                return 2
+        print("Connected — file-transfer mode active.")
+
+        # Drain any residual handshake spam + ERROR-echoes that the device
+        # may have buffered before / during the transition into transfer
+        # mode. The firmware also self-drains on entry, but we belt-and-
+        # brace here to be sure nothing leftover poisons the first command.
         time.sleep(0.5)
         ser.reset_input_buffer()
-        # Nudge the device with a single newline so it re-emits its prompt.
-        ser.write(b"\n")
-        ser.flush()
-        try:
-            wait_for_ready(ser, timeout_s=5.0)
-        except TimeoutError:
-            print("WARNING: didn't see READY from device. Continuing — the device "
-                  "may already have been mid-output. If commands fail, reset the "
-                  "OLA and re-enter file-transfer mode (2-press RESET).")
 
         # List
         print("\nFetching file list...")

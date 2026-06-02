@@ -231,6 +231,10 @@ static void cmd_get(int target_idx)
 
     if (!crc32_inited) crc32_init();
     uint32_t crc = 0;
+    // 1 KB chunks — empirically determined sweet spot on the Apollo3+CH340
+    // path. 2 KB and 4 KB both broke the subsequent `list` command (probably
+    // an Apollo3 stack-budget / TX-buffer interaction, possibly LTO-related);
+    // 1 KB transfers reliably and yields ~56 KB/s through the CH340.
     uint8_t buf[1024];
     uint32_t remaining = t.size_bytes;
     while (remaining > 0) {
@@ -296,6 +300,20 @@ void enter_file_transfer_mode(void)
     SERIAL_USB->print(F("Firmware: "));
     SERIAL_USB->println(commit_id);
     SERIAL_USB->println(F("Type 'help' for the command list."));
+
+    // If we got here via the host handshake (main.cpp accepted
+    // OLA_ENTER_TRANSFER from the script's spam burst), there are almost
+    // certainly more leftover spam tokens still in the RX buffer. Drain them
+    // for ~300 ms so the first real read_line() doesn't pick up a stale
+    // "OLA_ENTER_TRANSFER" and reject it as ERROR unknown_command.
+    unsigned long const drain_start = millis();
+    while (millis() - drain_start < 300){
+        while (SERIAL_USB->available()){
+            (void)SERIAL_USB->read();
+        }
+        delay(10);
+    }
+
     SERIAL_USB->println(F("READY"));
 
     char buf[128];

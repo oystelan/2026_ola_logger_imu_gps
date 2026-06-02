@@ -554,6 +554,41 @@ void setup() {
   wdt.restart();
 
   /////////////////////////////////////////////////////////////////////////////////
+  // Host-handshake fallback: if the user is connecting via serial_transfer.py,
+  // the script has been writing "OLA_ENTER_TRANSFER\n" continuously since it
+  // opened the port. Those bytes accumulated in our USB-CDC RX buffer during
+  // boot + multi-press-window. Scan the buffer once for the magic token and,
+  // if present, promote the boot action to FILE_TRANSFER without requiring a
+  // physical RESET double-press. Only overrides NORMAL — explicit calibration
+  // requests via multi-press are preserved.
+  if (boot_action == CalibrationManager::BootAction::NORMAL){
+    // We may have boot-banner / RTC-seed output already in the TX buffer; flush
+    // it so the host knows we are alive and sees nothing weird interspersed.
+    SERIAL_USB->flush();
+    // Listen for up to 500 ms so a script that connects DURING our boot still
+    // has a chance to be heard (CDC buffer may not be ready until ~1.5 s post-
+    // reset on Apollo3; this catches the tail of the script's spam burst).
+    char rxbuf[256];
+    size_t n = 0;
+    unsigned long const probe_start = millis();
+    while (millis() - probe_start < 500){
+      while (SERIAL_USB->available() && n < sizeof(rxbuf) - 1){
+        rxbuf[n++] = (char)SERIAL_USB->read();
+      }
+      rxbuf[n] = '\0';
+      if (strstr(rxbuf, "OLA_ENTER_TRANSFER") != nullptr){
+        boot_action = CalibrationManager::BootAction::FILE_TRANSFER;
+        SERIAL_USB->println();
+        SERIAL_USB->println(F("=== HOST HANDSHAKE ACCEPTED -> FILE TRANSFER mode ==="));
+        break;
+      }
+      delay(10);
+      wdt.restart();
+    }
+  }
+  wdt.restart();
+
+  /////////////////////////////////////////////////////////////////////////////////
   // File-transfer mode short-circuit. Bring up only the SD card (we don't need
   // IMU or GNSS) and hand control to the file-transfer command loop on the USB
   // serial. enter_file_transfer_mode() never returns — it reboots on `exit`.
