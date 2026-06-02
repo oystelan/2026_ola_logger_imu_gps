@@ -9,8 +9,8 @@
 // Responsibilities:
 //   1. Multi-press detection on the hardware RESET button. The button is wired
 //      to NRST so each press reboots the chip; we detect "2 presses" / "3
-//      presses" across reboots using a decision-pending flag in EEPROM (see
-//      detect_boot_action()).
+//      presses" / "4 presses" across reboots using a decision-pending flag in
+//      EEPROM (see detect_boot_action()).
 //   2. Persistent storage of sensor biases in EEPROM (survives power loss).
 //   3. Running the calibration procedures (Tier 1: gyro bias; Tier 2: mag
 //      hard-iron — reserved, not yet implemented).
@@ -23,15 +23,17 @@
 class CalibrationManager {
 public:
     enum class BootAction : uint8_t {
-        NORMAL   = 0,
-        GYRO_CAL = 1,
-        MAG_CAL  = 2,
+        NORMAL        = 0,
+        GYRO_CAL      = 1,
+        MAG_CAL       = 2,
+        FILE_TRANSFER = 3,
     };
 
     // Detect how many times RESET was pressed in quick succession.
-    //   1 press  → NORMAL   (ordinary reboot)
-    //   2 presses → GYRO_CAL
-    //   3 presses → MAG_CAL
+    //   1 press  → NORMAL          (ordinary reboot)
+    //   2 presses → FILE_TRANSFER   (USB-serial download mode)
+    //   3 presses → MAG_CAL          (magnetometer hard-iron calibration)
+    //   4 presses → GYRO_CAL         (gyro bias calibration)
     // Must be called EARLY in setup(), after the STAT LED pin is configured
     // and millis() is valid (i.e. after burst mode / RTC setup). Blocks for
     // `window_ms` while the decision window is open, blinking the STAT LED so
@@ -100,7 +102,7 @@ private:
     static constexpr uint8_t GYRO_VALID_MAGIC      = 0x5A;
     static constexpr uint8_t MAG_VALID_MAGIC       = 0x96;
     static constexpr uint8_t TIME_VALID_MAGIC      = 0xC3;
-    static constexpr uint8_t MAX_PRESS_COUNT       = 3;
+    static constexpr uint8_t MAX_PRESS_COUNT       = 4;
 
     int16_t gyro_bias_x_ {0};
     int16_t gyro_bias_y_ {0};

@@ -8,6 +8,7 @@
 #include "gnss_manager.h"
 #include "sleep_manager.h"
 #include "sd_card_manager.h"
+#include "file_transfer.h"
 
 #include "Wire.h"
 #include <SPI.h>
@@ -241,7 +242,7 @@ extern "C" void am_ctimer_isr(void)
         //   PCB_gy = +chip_gy
         //   PCB_gz = +chip_gz
         // Bias is stored in PCB body frame (= raw chip frame here); re-run gyro
-        // cal (double-tap RESET) after flashing — any previously stored bias
+        // cal (quadruple-tap RESET) after flashing — any previously stored bias
         // was in the wrong frame.
         int16_t gx = (int16_t)(gx_chip - g_gyro_bias_x);
         int16_t gy = (int16_t)(gy_chip - g_gyro_bias_y);
@@ -528,11 +529,14 @@ void setup() {
   /////////////////////////////////////////////////////////////////////////////////
   // Report RESET multi-press result and load any stored calibration.
   switch (boot_action){
-    case CalibrationManager::BootAction::GYRO_CAL:
-      SERIAL_USB->println(F("RESET double-press detected -> GYRO CALIBRATION requested"));
+    case CalibrationManager::BootAction::FILE_TRANSFER:
+      SERIAL_USB->println(F("RESET double-press detected -> FILE TRANSFER mode requested"));
       break;
     case CalibrationManager::BootAction::MAG_CAL:
       SERIAL_USB->println(F("RESET triple-press detected -> MAG CALIBRATION requested"));
+      break;
+    case CalibrationManager::BootAction::GYRO_CAL:
+      SERIAL_USB->println(F("RESET quadruple-press detected -> GYRO CALIBRATION requested"));
       break;
     default:
       break;
@@ -548,6 +552,20 @@ void setup() {
   g_mag_bias_y = calibration_manager.mag_bias_y();
   g_mag_bias_z = calibration_manager.mag_bias_z();
   wdt.restart();
+
+  /////////////////////////////////////////////////////////////////////////////////
+  // File-transfer mode short-circuit. Bring up only the SD card (we don't need
+  // IMU or GNSS) and hand control to the file-transfer command loop on the USB
+  // serial. enter_file_transfer_mode() never returns — it reboots on `exit`.
+  if (boot_action == CalibrationManager::BootAction::FILE_TRANSFER){
+    SERIAL_USB->println(F("Starting SD card for file-transfer mode..."));
+    if (!sd_card_manager.start()){
+      SERIAL_USB->println(F("ERROR sd_init_failed — cannot enter transfer mode. Rebooting in 5s."));
+      delay(5000);
+      NVIC_SystemReset();
+    }
+    enter_file_transfer_mode();   // NEVER RETURNS
+  }
 
   /////////////////////////////////////////////////////////////////////////////////
   // Print boot count and offer to reset it
@@ -917,7 +935,7 @@ void setup() {
     SERIAL_USB->println(F("ICM-20948 setup complete."));
 
     ////////////////////////////////////////////////////
-    // Tier-1 gyro bias calibration (triggered by RESET double-press).
+    // Tier-1 gyro bias calibration (triggered by RESET quadruple-press).
     // Runs here: IMU + FIFO are configured but the CTIMER ISR is not yet
     // started, so we can poll the gyro directly without contention. We read
     // via getAGMT() (direct registers) and store the bias in CHIP frame —
@@ -926,6 +944,8 @@ void setup() {
     // registers.
     if (boot_action == CalibrationManager::BootAction::GYRO_CAL){
       SERIAL_USB->println(F("=== GYRO CALIBRATION ==="));
+      // Mode-entry LED signature: 5 short flashes.
+      blink_stat_led(5, 80, 120);
       SERIAL_USB->println(F("Keep the device PERFECTLY STILL for 5 seconds..."));
       delay(500);  // brief pause so the user stops touching the board after reset
       wdt.restart();
@@ -999,6 +1019,10 @@ void setup() {
     // which subtracts it before logging.
     if (boot_action == CalibrationManager::BootAction::MAG_CAL){
       SERIAL_USB->println(F("=== MAGNETOMETER CALIBRATION ==="));
+      // Mode-entry LED signature: 3 short flashes + 2 long flashes.
+      blink_stat_led(3, 80, 150);
+      delay(250);
+      blink_stat_led(2, 400, 250);
       SERIAL_USB->println(F("Rotate the device through as many 3D orientations"));
       SERIAL_USB->println(F("as you can (figure-8 motion in all axes) for 30 s."));
       SERIAL_USB->println(F("Stay >1 m clear of metal furniture / electronics."));
@@ -1356,8 +1380,33 @@ void setup() {
     number_pps_fixes_logged = 0;
     am_hal_interrupt_master_enable();
 
+    // Heartbeat LED. While in normal logging mode, give the STAT LED a short
+    // 50 ms ON pulse every 3 seconds so the user can distinguish "logging" at
+    // a glance from the other modes (file-transfer pulse, mag-cal slow blink,
+    // gyro-cal fast blink). We only write the LED on the *edges* of the
+    // pulse — during the off-phase between pulses the SD-write toggle in
+    // sd_card_manager.cpp is free to drive the LED itself (so SD-busy bursts
+    // still flash visibly between heartbeats).
+    static constexpr unsigned long HEARTBEAT_PERIOD_MS = 3000;
+    static constexpr unsigned long HEARTBEAT_ON_MS     = 50;
+    static unsigned long heartbeat_start_ms = millis();
+    static bool heartbeat_was_high = false;
+
     while (board_time_manager.get_posix_timestamp() < posix_timestamp_next_file){
       should_log_data = false;
+
+      {
+        unsigned long const now_ms = millis();
+        unsigned long const phase = (now_ms - heartbeat_start_ms) % HEARTBEAT_PERIOD_MS;
+        bool const in_pulse = (phase < HEARTBEAT_ON_MS);
+        if (in_pulse && !heartbeat_was_high) {
+          digitalWrite(PIN_STAT_LED, HIGH);
+          heartbeat_was_high = true;
+        } else if (!in_pulse && heartbeat_was_high) {
+          digitalWrite(PIN_STAT_LED, LOW);
+          heartbeat_was_high = false;
+        }
+      }
 
       // log
       // the logging from sensors to dequeues buffers is taken care of by the ISR driven routines

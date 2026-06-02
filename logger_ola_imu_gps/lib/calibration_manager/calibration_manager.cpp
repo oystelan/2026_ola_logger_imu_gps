@@ -54,8 +54,9 @@ CalibrationManager::detect_boot_action(int stat_led_pin, unsigned long window_ms
     EEPROM.put(ADDR_MULTIPRESS_FLAG, FLAG_IDLE);
 
     switch (count) {
-        case 2:  return BootAction::GYRO_CAL;
+        case 2:  return BootAction::FILE_TRANSFER;
         case 3:  return BootAction::MAG_CAL;
+        case 4:  return BootAction::GYRO_CAL;
         default: return BootAction::NORMAL;
     }
 }
@@ -145,7 +146,7 @@ void CalibrationManager::print_state(Stream &out) const
         out.print(F(" z="));
         out.println(gyro_bias_z_);
     } else {
-        out.println(F("none stored (run double-tap RESET to calibrate)"));
+        out.println(F("none stored (run quadruple-tap RESET to calibrate)"));
     }
 
     out.print(F("Mag  calibration: "));
