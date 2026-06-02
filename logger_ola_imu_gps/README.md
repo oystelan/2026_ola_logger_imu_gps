@@ -58,8 +58,9 @@ The hardware RESET button doubles as a calibration trigger. Each press reboots t
 | Presses | Action |
 |---|---|
 | 1 (normal) | Boot normally; load stored biases from EEPROM |
-| **2** | **Tier 1: gyro bias calibration** — keep the device perfectly still for 5 s after the second press. The firmware averages gyro readings over 5 s, stores the bias in EEPROM, and from then on subtracts it from every logged sample. Survives power loss. |
-| **3** | Tier 2: magnetometer hard-iron calibration (reserved; not yet implemented) |
+| **2** | **USB-serial file transfer** — skips logging setup, brings up the SD card, listens on USB serial for `list` / `get <N>` / `info` / `exit` commands. Use [`decoder/serial_transfer.py`](../decoder/serial_transfer.py) to download recordings without removing the SD card. |
+| **3** | **Tier 2: magnetometer hard-iron calibration** — rotate the device through many 3D orientations for 30 s while the firmware fits a sphere to the mag readings; the offset is stored in EEPROM and subtracted from every logged sample. |
+| **4** | **Tier 1: gyro bias calibration** — keep the device perfectly still for 5 s; the firmware averages gyro readings, stores the bias in EEPROM, and subtracts it from every logged sample. Survives power loss. |
 
 The STAT LED blinks during the decision window — faster blinks mean a higher press count has been registered, giving you live feedback that the multi-press is being detected.
 
@@ -142,7 +143,7 @@ This started as a clean project and ended up as a mix of old libs, new libs, cus
 At baudrate 1000000 over USB, the logger prints status during boot and periodic rate/deque summaries during logging. A typical session looks something like:
 
 ```
-=== GYRO CALIBRATION ===  (only if RESET was double-pressed)
+=== GYRO CALIBRATION ===  (only if RESET was quadruple-pressed)
 Keep the device PERFECTLY STILL for 5 seconds...
 ...
 
