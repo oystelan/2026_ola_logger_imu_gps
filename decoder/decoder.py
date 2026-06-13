@@ -2000,16 +2000,114 @@ def load_and_combine_segments(npz_file: Path) -> dict[str, Any]:
     return result
 
 
-def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
+def _detect_local_median_spikes(
+    arr: np.ndarray,
+    window: int = 9,
+    z_threshold: float = 5.0,
+    max_cluster: int = 10,
+) -> np.ndarray:
+    """Flag short spike clusters (1..max_cluster samples) that deviate from
+    the local median by more than z_threshold * robust_sigma.
+
+    Used for accelerometer: occasional 1-5 sample bursts of wildly wrong
+    int16 values that the on-board MISO signal-integrity issue can produce
+    in FIFO reads (see BOOT_000085 at-rest spikes — clean baseline ±5 mg
+    with single-axis swings up to ±300 mg lasting 1-5 samples).
+
+    Returns: bool array, True where the sample is a spike.
+    """
+    from scipy.signal import medfilt
+    arr = np.asarray(arr, dtype=np.float64)
+    if len(arr) < window:
+        return np.zeros(len(arr), dtype=bool)
+    # Ensure odd window (scipy requirement)
+    if window % 2 == 0:
+        window += 1
+    filtered = medfilt(arr, kernel_size=window)
+    residual = arr - filtered
+    # Robust sigma from MAD of the residual
+    sigma = 1.4826 * np.median(np.abs(residual - np.median(residual))) + 1e-9
+    raw_mask = np.abs(residual) > z_threshold * sigma
+
+    # Group into clusters; drop clusters longer than max_cluster (those are
+    # real sustained motion, not single-event spikes)
+    final = np.zeros(len(arr), dtype=bool)
+    in_cluster = False
+    cluster_start = 0
+    for i in range(len(raw_mask)):
+        if raw_mask[i] and not in_cluster:
+            cluster_start = i
+            in_cluster = True
+        elif not raw_mask[i] and in_cluster:
+            cluster_len = i - cluster_start
+            if cluster_len <= max_cluster:
+                final[cluster_start:i] = True
+            in_cluster = False
+    if in_cluster:
+        cluster_len = len(raw_mask) - cluster_start
+        if cluster_len <= max_cluster:
+            final[cluster_start:] = True
+    return final
+
+
+def _detect_constant_runs(
+    arr: np.ndarray,
+    min_run_length: int = 5,
+) -> np.ndarray:
+    """Flag runs of consecutive identical values of length >= min_run_length.
+
+    Used for gyroscope and magnetometer: when the CTIMER ISR is masked
+    during SD-card writes (SDIrqGuard), the firmware uses the last cached
+    getAGMT() reading for every accel sample it drains from the FIFO when
+    the ISR resumes. The result is a flat-spot of typically 10-45 samples
+    where gyr / mag never change.
+
+    Returns: bool array, True where the sample is inside a flat-spot.
+    """
+    arr = np.asarray(arr)
+    n = len(arr)
+    mask = np.zeros(n, dtype=bool)
+    if n < min_run_length:
+        return mask
+    diff = np.diff(arr)
+    change = np.where(diff != 0)[0]
+    starts = np.concatenate(([0], change + 1))
+    ends = np.concatenate((change + 1, [n]))
+    for s, e in zip(starts, ends):
+        if (e - s) >= min_run_length:
+            mask[s:e] = True
+    return mask
+
+
+def _interpolate_flagged(arr: np.ndarray, flag: np.ndarray) -> np.ndarray:
+    """Replace flagged samples with linear interpolation from the nearest
+    unflagged neighbours on each side. A flagged region at the very start
+    or end (no valid neighbour on one side) gets the nearest valid value.
+    """
+    arr = np.asarray(arr, dtype=np.float64).copy()
+    if not flag.any():
+        return arr
+    valid_idx = np.where(~flag)[0]
+    if len(valid_idx) == 0:
+        return arr
+    flagged_idx = np.where(flag)[0]
+    arr[flagged_idx] = np.interp(flagged_idx, valid_idx, arr[valid_idx])
+    return arr
+
+
+def load_data_as_arrays(npz_file: Path, clean: bool = True) -> dict[str, np.ndarray]:
     """Load decoded data and extract all fields as individual numpy arrays.
-    
+
     This is the recommended way for end users to load decoded data. It provides
     easy access to all sensor readings and timestamps as numpy arrays, ready for
     analysis and plotting.
-    
+
     Args:
         npz_file: Path to the decoded .npz file
-        
+        clean:    If True (default), also compute *_clean and *_interp_flag
+                  arrays for accel / gyro / mag with hardware-artefact samples
+                  interpolated out. Set False to skip and save a bit of CPU.
+
     Returns:
         Dictionary mapping field names to numpy arrays. Keys include:
         
@@ -2062,7 +2160,14 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         - 'imu_gyr_x_outlier': Outlier flags for X gyroscope
         - 'imu_gyr_y_outlier': Outlier flags for Y gyroscope
         - 'imu_gyr_z_outlier': Outlier flags for Z gyroscope
-        
+
+        **Cleaned IMU Data (only if `clean=True`, default):**
+        - 'imu_{acc,gyr,mag}_{x,y,z}_clean': Same as raw arrays but with
+          hardware artefacts (MISO-glitch accel spikes, SD-stall gyro/mag
+          flat-spots) linearly interpolated from their neighbours
+        - 'imu_{acc,gyr,mag}_{x,y,z}_interp_flag': bool array, True where
+          the corresponding *_clean sample is interpolated rather than raw
+
     Example:
         >>> from pathlib import Path
         >>> from decoder import decode_file, load_data_as_arrays
@@ -2213,6 +2318,59 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['imu_mag_x_outlier'] = np.array([i.mag_x_uT_stdchecked for i in imu_data], dtype=bool)
         result['imu_mag_y_outlier'] = np.array([i.mag_y_uT_stdchecked for i in imu_data], dtype=bool)
         result['imu_mag_z_outlier'] = np.array([i.mag_z_uT_stdchecked for i in imu_data], dtype=bool)
+
+        # Cleaning pass: detect hardware-artefact spikes / flat-spots and
+        # linearly interpolate them out. Original raw arrays above are
+        # untouched. The boolean *_interp_flag arrays mark which samples
+        # were interpolated.
+        if clean:
+            for axis in ('x', 'y', 'z'):
+                # Accel: detect MISO-glitch spikes (1-5 sample bursts).
+                # z_threshold=8 catches at-rest residuals >~15 mg, well
+                # below the 100+ mg of typical MISO glitches but high
+                # enough that sharp real motion (BOOT_000085 motion phase
+                # reaches residuals of 67-191 mg) doesn't get over-flagged.
+                acc_raw = result[f'imu_acc_{axis}']
+                acc_flag = _detect_local_median_spikes(
+                    acc_raw, window=9, z_threshold=8.0, max_cluster=10,
+                )
+                result[f'imu_acc_{axis}_interp_flag'] = acc_flag
+                result[f'imu_acc_{axis}_clean'] = _interpolate_flagged(acc_raw, acc_flag)
+
+                # Gyro: detect SD-stall flat-spots only. Min run length = 20
+                # samples (~89 ms). Run-length histogram on the BOOT_000085
+                # at-rest portion: chip noise produces 99% of runs at 1-2
+                # samples, with occasional 3-5 sample runs. The SD-stall
+                # window is ~200 ms = 30-50 samples — cleanly separated.
+                # We deliberately skip local-median spike detection on gyro
+                # because at very low noise the filter residual sigma goes
+                # to zero and EVERY sub-LSB ripple gets flagged as a spike.
+                gyr_raw = result[f'imu_gyr_{axis}']
+                gyr_flag = _detect_constant_runs(gyr_raw, min_run_length=20)
+                result[f'imu_gyr_{axis}_interp_flag'] = gyr_flag
+                result[f'imu_gyr_{axis}_clean'] = _interpolate_flagged(gyr_raw, gyr_flag)
+
+                # Mag: same rationale as gyro. The AK09916 samples at ~100 Hz,
+                # so at our 225 Hz IMU rate the mag value naturally repeats
+                # for 2-8 samples per chip update. Only runs of 20+ are
+                # SD-stall artefacts worth interpolating over (verified
+                # against BOOT_000085 run-length histogram).
+                mag_raw = result[f'imu_mag_{axis}']
+                mag_flag = _detect_constant_runs(mag_raw, min_run_length=20)
+                result[f'imu_mag_{axis}_interp_flag'] = mag_flag
+                result[f'imu_mag_{axis}_clean'] = _interpolate_flagged(mag_raw, mag_flag)
+
+            n = len(result['imu_acc_x'])
+            n_flagged_acc = sum(int(result[f'imu_acc_{a}_interp_flag'].sum()) for a in 'xyz')
+            n_flagged_gyr = sum(int(result[f'imu_gyr_{a}_interp_flag'].sum()) for a in 'xyz')
+            n_flagged_mag = sum(int(result[f'imu_mag_{a}_interp_flag'].sum()) for a in 'xyz')
+            n_total_channels = 9 * n  # 3 axes × 3 sensors
+            logger.info(
+                f"Cleaning pass: interpolated {n_flagged_acc} accel + "
+                f"{n_flagged_gyr} gyro + {n_flagged_mag} mag samples "
+                f"(out of {n_total_channels} channel-samples; "
+                f"{100*(n_flagged_acc+n_flagged_gyr+n_flagged_mag)/n_total_channels:.2f}%)"
+            )
     else:
         result['imu_micros'] = np.array([])
         result['imu_micros_unwrapped'] = np.array([])
@@ -2237,7 +2395,12 @@ def load_data_as_arrays(npz_file: Path) -> dict[str, np.ndarray]:
         result['imu_mag_x_outlier'] = np.array([], dtype=bool)
         result['imu_mag_y_outlier'] = np.array([], dtype=bool)
         result['imu_mag_z_outlier'] = np.array([], dtype=bool)
-    
+        if clean:
+            for sensor in ('acc', 'gyr', 'mag'):
+                for axis in ('x', 'y', 'z'):
+                    result[f'imu_{sensor}_{axis}_clean'] = np.array([])
+                    result[f'imu_{sensor}_{axis}_interp_flag'] = np.array([], dtype=bool)
+
     return result
 
 
