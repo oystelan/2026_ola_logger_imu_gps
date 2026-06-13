@@ -1543,6 +1543,8 @@ def process_imu_entry(
     gyr_sensitivity: float,
     prev_imu_micros: int | None = None,
     mag_sensitivity: float | None = None,
+    prev_imu_counter: int | None = None,
+    clip_at_counter_discontinuity: bool = True,
 ) -> tuple[int, bool, bool]:
     """Process a single IMU entry.
 
@@ -1552,6 +1554,15 @@ def process_imu_entry(
                          MARKER_SIZE + imu_struct_size + (2 padding if 18, 0 if 24).
         prev_imu_micros: Previous IMU micros value for jump detection (None if first in segment)
         mag_sensitivity: Mag sensitivity in uT/LSB if mag is logged (struct=24), else None.
+        prev_imu_counter: Previous IMU sample counter for end-of-data detection
+                          (None if first in segment).
+        clip_at_counter_discontinuity: If True (default), a break in the +1 counter
+                          sequence is treated as end-of-real-data: the bad entry is
+                          NOT appended, idx is NOT advanced, and should_break=True is
+                          returned so the caller can stop parsing. Pre-existing data
+                          on a non-zero-formatted SD card after the firmware stops
+                          mid-write looks like valid IMU records on resync, and this
+                          is the only signal that reliably tells them apart.
 
     Returns:
         Tuple of (new_idx, should_break, jump_detected)
@@ -1577,11 +1588,33 @@ def process_imu_entry(
         return idx, True, False
 
     # Parse entry
+    marker_idx = idx
     idx += 4
     imu_data = content[idx : idx + imu_struct_size]
     try:
         imu_entry = parse_imu_entry(imu_data, acc_sensitivity, gyr_sensitivity, mag_sensitivity)
-        
+
+        # Counter-continuity check — clip end-of-real-data.
+        # The firmware stamps every IMU sample with counter = imu_isr_count++ in the ISR,
+        # so consecutive on-disk entries must satisfy counter == (prev + 1) & 0xFFFF.
+        # FIFO overflows at the chip level do not produce skips here (the firmware
+        # only sees and counts samples it actually pops), so a discontinuity means
+        # the firmware stopped writing (e.g. user unplugged the logger) and the
+        # bytes we're now reading are stale data left on the SD card from a previous
+        # session that wasn't zero-formatted.
+        if (
+            clip_at_counter_discontinuity
+            and prev_imu_counter is not None
+            and imu_entry.counter != ((prev_imu_counter + 1) & 0xFFFF)
+        ):
+            expected = (prev_imu_counter + 1) & 0xFFFF
+            logger.warning(
+                f"IMU counter discontinuity at offset {marker_idx}: "
+                f"expected {expected}, got {imu_entry.counter}. "
+                f"Treating as end-of-real-data; stopping parse."
+            )
+            return marker_idx, True, False
+
         # Check for micros jump if we have previous value
         jump_detected = False
         if prev_imu_micros is not None:
@@ -1638,18 +1671,22 @@ def parse_binary_content(
     gps_marker: bytes,
     imu_marker: bytes,
     footer_marker: bytes,
+    clip_at_counter_discontinuity: bool = True,
 ) -> list[dict[str, list]]:
     """Parse binary content and extract all PPS, GNSS, and IMU entries in segments.
-    
+
     Segments are created based on two conditions:
     1. Time-based: once n_imus_per_segment IMU entries are reached (~1 minute)
     2. Jump-based: when IMU micros has a negative jump or positive jump > 1 second
-    
+
     Args:
         content: Full file content as bytes
         header_info: Parsed header information
         pps_marker, gps_marker, imu_marker, footer_marker: Entry markers
-        
+        clip_at_counter_discontinuity: If True (default), parsing stops at the first
+            IMU sample whose counter is not (prev + 1) & 0xFFFF. This is the
+            recommended setting; see process_imu_entry() for the rationale.
+
     Returns:
         List of segment dicts, each containing {'pps_list': [], 'gnss_list': [], 'imu_list': []}
     """
@@ -1690,7 +1727,11 @@ def parse_binary_content(
     segments.append(current_segment)
     segment_imu_count = 0
     prev_imu_micros = None  # Track previous IMU micros for jump detection
-    
+    prev_imu_counter = None  # Track previous IMU counter for end-of-data clipping
+
+    counter_clip_idx: int | None = None  # Set when parsing stops on counter discontinuity
+    counter_clip_samples: int = 0
+
     start_offset = 0
     idx = 0
     while idx < len(content):
@@ -1705,6 +1746,7 @@ def parse_binary_content(
             segments.append(current_segment)
             segment_imu_count = 0
             prev_imu_micros = None  # Reset for new segment
+            prev_imu_counter = None  # Reset for new segment
         
         if content[idx : idx + 4] == pps_marker:
             idx, should_break = process_pps_entry(
@@ -1725,36 +1767,46 @@ def parse_binary_content(
                 break
                 
         elif content[idx : idx + 4] == imu_marker:
+            entry_start_idx = idx
             idx, should_break, jump_detected = process_imu_entry(
                 content, idx, current_segment['pps_list'], current_segment['gnss_list'], current_segment['imu_list'],
                 pps_marker, gps_marker, imu_marker, footer_marker,
                 imu_struct_size, acc_sensitivity, gyr_sensitivity,
-                prev_imu_micros, mag_sensitivity
+                prev_imu_micros, mag_sensitivity,
+                prev_imu_counter, clip_at_counter_discontinuity,
             )
             if should_break:
+                # If process_imu_entry stopped at a counter discontinuity it did
+                # not advance idx past the marker, so idx still points at the
+                # offending entry. That's our clip point.
+                if idx == entry_start_idx:
+                    counter_clip_idx = idx
+                    counter_clip_samples = sum(len(s['imu_list']) for s in segments)
                 break
-            
+
             # Check if jump was detected and we should start a new segment
             if jump_detected and len(current_segment['imu_list']) > 0:
                 # Move the current IMU entry (which has the jump) to a new segment
                 jumped_imu_entry = current_segment['imu_list'].pop()
-                
+
                 logger.info(
                     f"Starting segment {len(segments)} at byte {idx} "
                     f"(segment {len(segments)-1} had {segment_imu_count} IMUs, "
                     f"{len(current_segment['pps_list'])} PPS, {len(current_segment['gnss_list'])} GNSS) - MICROS JUMP"
                 )
-                
+
                 # Start new segment with the jumped entry
                 current_segment = {'pps_list': [], 'gnss_list': [], 'imu_list': [jumped_imu_entry]}
                 segments.append(current_segment)
                 segment_imu_count = 1
                 prev_imu_micros = jumped_imu_entry.micros_reading
+                prev_imu_counter = jumped_imu_entry.counter
             else:
                 # Normal processing
                 segment_imu_count += 1
                 if len(current_segment['imu_list']) > 0:
                     prev_imu_micros = current_segment['imu_list'][-1].micros_reading
+                    prev_imu_counter = current_segment['imu_list'][-1].counter
                 
         elif footer_marker in content[idx : idx + len(footer_marker) + 10]:
             logger.info("Found footer marker, stopping parsing")
@@ -1770,7 +1822,15 @@ def parse_binary_content(
     total_gnss = sum(len(seg['gnss_list']) for seg in segments)
     total_imu = sum(len(seg['imu_list']) for seg in segments)
     
-    if not footer_found and idx >= len(content):
+    if counter_clip_idx is not None:
+        discarded = len(content) - counter_clip_idx
+        logger.warning(
+            f"Clipped at byte {counter_clip_idx} after {counter_clip_samples} valid "
+            f"IMU samples — IMU counter discontinuity = end of real data. "
+            f"{discarded:,} trailing bytes ({discarded/len(content)*100:.1f}% of file) "
+            f"discarded as stale (pre-existing data on a non-zero-formatted SD card)."
+        )
+    elif not footer_found and idx >= len(content):
         logger.warning(f"Missing footer at end of file (byte {len(content)})")
         logger.error(
             f"File incomplete. Parsed {total_pps} PPS, "
@@ -2193,6 +2253,7 @@ def decode_file(
     gps_struct_size: int = GPS_STRUCT_SIZE,
     imu_struct_size: int = IMU_STRUCT_SIZE,
     allow_no_pps: bool = False,
+    clip_at_counter_discontinuity: bool = True,
 ) -> dict[str, Path]:
     """Decode a single data file and save to compressed numpy archive with segments.
 
@@ -2236,7 +2297,8 @@ def decode_file(
 
     # Parse binary content into segments
     segments = parse_binary_content(
-        content, header_info, pps_marker, gps_marker, imu_marker, footer_marker
+        content, header_info, pps_marker, gps_marker, imu_marker, footer_marker,
+        clip_at_counter_discontinuity=clip_at_counter_discontinuity,
     )
 
     # Process each segment independently with unwrap offset carryover
