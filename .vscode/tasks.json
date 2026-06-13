@@ -1,0 +1,82 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "PIO: Build firmware",
+            "type": "shell",
+            "command": "C:\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": [
+                "run",
+                "-d",
+                "${workspaceFolder}\\logger_ola_imu_gps"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc",
+            "presentation": {
+                "panel": "shared",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "PIO: Upload firmware",
+            "type": "shell",
+            "command": "C:\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": [
+                "run",
+                "-t",
+                "upload",
+                "--upload-port",
+                "COM4",
+                "-d",
+                "${workspaceFolder}\\logger_ola_imu_gps"
+            ],
+            "group": "build",
+            "problemMatcher": "$gcc",
+            "presentation": {
+                "panel": "shared",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "PIO: Serial monitor",
+            "type": "shell",
+            "command": "C:\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": [
+                "device",
+                "monitor",
+                "--port",
+                "COM4",
+                "-d",
+                "${workspaceFolder}\\logger_ola_imu_gps"
+            ],
+            "isBackground": true,
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "PIO: Clean build",
+            "type": "shell",
+            "command": "C:\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": [
+                "run",
+                "-t",
+                "clean",
+                "-d",
+                "${workspaceFolder}\\logger_ola_imu_gps"
+            ],
+            "presentation": {
+                "panel": "shared",
+                "reveal": "always",
+                "clear": true
+            }
+        }
+    ]
+}
