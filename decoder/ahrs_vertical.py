@@ -1627,3 +1627,257 @@ def compute_vertical_motion_fixed_attitude(
         low_hz=low_hz,
         high_hz=high_hz,
     )
+
+
+def mahony_step_imu(
+    state: MadgwickState,
+    e_int: np.ndarray,
+    accel_body: np.ndarray,
+    gyro_body: np.ndarray,
+    dt: float,
+    kp: float = 1.0,
+    ki: float = 0.2,
+    motion_gate_threshold: float = 0.5,
+) -> tuple[bool, np.ndarray]:
+    """Single Mahony (explicit complementary) step using accel + gyro.
+
+    The key difference from `madgwick_step_imu`: the integral term `e_int`
+    accumulates the accel-vs-gravity error over time and is added back to the
+    gyro as an estimated **gyro bias**. This is what makes Mahony robust to the
+    sustained-rotation case that breaks plain Madgwick — even when the accel
+    correction is gated off during vigorous motion, the *learned bias* keeps the
+    pure-gyro propagation accurate, so the attitude doesn't drift/diverge.
+
+    Convention matches `madgwick_step_imu`: world frame z-down (NED-like),
+    accel at rest reads (0,0,-g) when level. The estimated gravity-down
+    direction in body is v = R(q)^T·[0,0,1] = [2(q1q3-q0q2), 2(q0q1+q2q3),
+    1-2(q1²+q2²)]; the measured gravity-down direction is -accel_normalised
+    (accel opposes gravity). The rotational error is their cross product.
+
+    Args:
+        state: MadgwickState (quaternion), updated in place.
+        e_int: (3,) running integral of the error (rad). Updated and returned.
+        kp: proportional gain — how hard the accel pulls attitude toward
+            gravity each step. ~1.0 typical.
+        ki: integral gain — rate at which gyro bias is learned. ~0.1-0.3.
+            Set 0 to disable bias estimation (pure proportional Mahony).
+        motion_gate_threshold: as in madgwick_step_imu — when |accel| is far
+            from g, the *accel correction and bias integration are skipped*,
+            but the already-learned bias (e_int) is STILL applied to the gyro.
+
+    Returns:
+        (used_accel, e_int) — whether the accel correction was applied, and the
+        updated integral term.
+    """
+    q0, q1, q2, q3 = state.q
+
+    a_norm = np.linalg.norm(accel_body)
+    if a_norm < 1e-6:
+        use_accel = False
+    elif abs(a_norm - 9.80665) > motion_gate_threshold:
+        use_accel = False
+    else:
+        use_accel = True
+
+    gx, gy, gz = gyro_body  # rad/s
+
+    if use_accel:
+        # Measured gravity-down direction (body): accel opposes gravity.
+        ax, ay, az = accel_body / a_norm
+        mx, my, mz = -ax, -ay, -az
+        # Estimated gravity-down direction (body) from current attitude.
+        vx = 2.0 * (q1 * q3 - q0 * q2)
+        vy = 2.0 * (q0 * q1 + q2 * q3)
+        vz = 1.0 - 2.0 * (q1 ** 2 + q2 ** 2)
+        # Error = measured × estimated (rotation that aligns estimate to meas).
+        ex = my * vz - mz * vy
+        ey = mz * vx - mx * vz
+        ez = mx * vy - my * vx
+        e = np.array([ex, ey, ez])
+        # Integral (bias) feedback — only accumulate when we trust the accel.
+        if ki > 0.0:
+            e_int = e_int + e * dt
+    else:
+        e = np.zeros(3)
+
+    # Corrected angular rate: gyro + proportional pull + learned bias.
+    omega = np.array([gx, gy, gz]) + kp * e + ki * e_int
+    wx, wy, wz = omega
+
+    qDot = 0.5 * np.array([
+        -q1 * wx - q2 * wy - q3 * wz,
+        +q0 * wx + q2 * wz - q3 * wy,
+        +q0 * wy - q1 * wz + q3 * wx,
+        +q0 * wz + q1 * wy - q2 * wx,
+    ])
+
+    q_new = state.q + qDot * dt
+    q_new /= np.linalg.norm(q_new)
+    state.q = q_new
+    return use_accel, e_int
+
+
+def compute_vertical_motion_mahony(
+    data: dict,
+    low_hz: float = 0.05,
+    high_hz: float = 2.5,
+    kp: float = 1.0,
+    ki: float = 0.2,
+    stationary_init_seconds: float = 2.0,
+    resample_hz: float | None = None,
+    use_outlier_flags: bool = True,
+    calibrate_gyro_bias: bool = True,
+    magnitude_mad_threshold: float = 8.0,
+    hampel_window_seconds: float = 0.25,
+    hampel_k_mad: float = 5.0,
+    motion_gate_threshold: float = 0.5,
+    detrend_polynomial_order: int = 3,
+    fft_taper_fraction: float = 0.1,
+    cutoff_softness: float = 0.3,
+    auto_align_gravity: bool = True,
+    gravity_detect_seconds: float = 2.0,
+) -> VerticalAHRSResult:
+    """Vertical motion via a Mahony filter with gyro-bias (Ki) feedback.
+
+    Same pipeline as `compute_vertical_motion` (gravity auto-align, outlier
+    filtering, FFT double-integration) but the attitude is tracked with a
+    Mahony explicit-complementary filter instead of Madgwick. The integral
+    term continuously estimates gyro bias, which prevents the attitude
+    divergence that plain Madgwick suffers under sustained rotation (the
+    group-3 ±40° rotation case). This is the canonical robust 6DOF attitude
+    filter — the same class SFY-type buoys use.
+
+    Args mostly mirror `compute_vertical_motion`; the Madgwick `beta` is
+    replaced by Mahony `kp` (proportional gain) and `ki` (integral / bias
+    gain).
+    """
+    imu_us = np.asarray(data["imu_micros_unwrapped"], dtype=np.float64)
+    n_raw = len(imu_us)
+    if n_raw < 100:
+        raise ValueError(f"Not enough IMU samples ({n_raw})")
+    t_raw = (imu_us - imu_us[0]) * 1e-6
+
+    mg_to_ms2 = G_STD / 1000.0
+    mdps_to_radps = (np.pi / 180.0) / 1000.0
+    acc = np.column_stack([
+        data["imu_acc_x"] * mg_to_ms2,
+        data["imu_acc_y"] * mg_to_ms2,
+        data["imu_acc_z"] * mg_to_ms2,
+    ])
+    gyr = np.column_stack([
+        data["imu_gyr_x"] * mdps_to_radps,
+        data["imu_gyr_y"] * mdps_to_radps,
+        data["imu_gyr_z"] * mdps_to_radps,
+    ])
+
+    if auto_align_gravity:
+        dt_med0 = float(np.median(np.diff(t_raw))) if n_raw > 1 else 0.01
+        n_detect = max(1, int(gravity_detect_seconds / max(dt_med0, 1e-6)))
+        acc, gyr, grav_desc = align_gravity_to_body_z(acc, gyr, n_detect)
+        logger.info(f"Gravity auto-align: {grav_desc}")
+
+    acc, gyr = _filter_imu_outliers(
+        t_raw, acc, gyr, data,
+        use_outlier_flags=use_outlier_flags,
+        magnitude_mad_threshold=magnitude_mad_threshold,
+        hampel_window_seconds=hampel_window_seconds,
+        hampel_k_mad=hampel_k_mad,
+    )
+
+    dt_med = float(np.median(np.diff(t_raw)))
+    n_init = max(1, min(n_raw, int(stationary_init_seconds / max(dt_med, 1e-6))))
+    a_mean = acc[:n_init].mean(axis=0)
+    state = MadgwickState(q=initial_attitude_from_accel(a_mean))
+    logger.info(
+        f"[mahony] Initial attitude from first {n_init} samples "
+        f"(~{n_init * dt_med:.1f}s): a_mean={a_mean.round(3)}, q0={state.q.round(3)}"
+    )
+    if calibrate_gyro_bias:
+        gyro_bias = gyr[:n_init].mean(axis=0)
+        gyr = gyr - gyro_bias
+        logger.info(
+            f"[mahony] Initial gyro bias: {np.rad2deg(gyro_bias).round(3)} deg/s "
+            f"— subtracted; Ki feedback refines the residual online"
+        )
+
+    quat_log = np.zeros((n_raw, 4))
+    quat_log[0] = state.q
+    e_int = np.zeros(3)
+    n_motion_gated = 0
+    for i in range(1, n_raw):
+        dt = t_raw[i] - t_raw[i - 1]
+        if dt <= 0 or dt > 1.0:
+            quat_log[i] = state.q
+            continue
+        if dt > 0.05:
+            n_sub = int(np.ceil(dt / 0.05))
+            sub_dt = dt / n_sub
+            for _ in range(n_sub):
+                used, e_int = mahony_step_imu(
+                    state, e_int, acc[i], gyr[i], sub_dt,
+                    kp=kp, ki=ki, motion_gate_threshold=motion_gate_threshold,
+                )
+        else:
+            used, e_int = mahony_step_imu(
+                state, e_int, acc[i], gyr[i], dt,
+                kp=kp, ki=ki, motion_gate_threshold=motion_gate_threshold,
+            )
+        if not used:
+            n_motion_gated += 1
+        quat_log[i] = state.q
+
+    rots = Rotation.from_quat(np.column_stack([
+        quat_log[:, 1], quat_log[:, 2], quat_log[:, 3], quat_log[:, 0],
+    ]))
+    acc_world = rots.apply(acc)
+    acc_world_linear = acc_world + np.array([0.0, 0.0, G_STD])
+    acc_z_up_raw = -acc_world_linear[:, 2]
+
+    eul = rots.as_euler("ZYX")
+    roll_deg = np.rad2deg(eul[:, 2])
+    pitch_deg = np.rad2deg(eul[:, 1])
+
+    if resample_hz is None:
+        fs = 1.0 / dt_med
+    else:
+        fs = float(resample_hz)
+    n_uniform = int(np.floor((t_raw[-1] - t_raw[0]) * fs)) + 1
+    t_uniform = t_raw[0] + np.arange(n_uniform) / fs
+    acc_z_up = np.interp(t_uniform, t_raw, acc_z_up_raw)
+    roll_uniform = np.interp(t_uniform, t_raw, roll_deg)
+    pitch_uniform = np.interp(t_uniform, t_raw, pitch_deg)
+
+    if detrend_polynomial_order >= 0:
+        acc_z_detrended = polynomial_detrend(acc_z_up, detrend_polynomial_order)
+    else:
+        acc_z_detrended = acc_z_up
+    acc_z_bp = lowpass_zero_phase(acc_z_detrended, fs, high_hz, order=4)
+    vel_z, disp_z = fft_double_integrate_bandpass(
+        acc_z_detrended, fs, low_hz, high_hz,
+        taper_fraction=fft_taper_fraction,
+        cutoff_softness=cutoff_softness,
+    )
+
+    if n_motion_gated:
+        logger.info(
+            f"[mahony] Motion-gating: skipped accel-correction on {n_motion_gated} "
+            f"samples ({100*n_motion_gated/max(n_raw,1):.1f}%); learned bias still "
+            f"applied. Final est. bias = {np.rad2deg(ki*e_int).round(3)} deg/s"
+        )
+    logger.success(
+        f"[mahony] Vertical AHRS complete: {n_raw} → {n_uniform} samples at "
+        f"{fs:.1f} Hz; kp={kp}, ki={ki}; σ_disp = {np.std(disp_z)*1000:.1f} mm"
+    )
+
+    return VerticalAHRSResult(
+        t=t_uniform - t_uniform[0],
+        accel_z_up=acc_z_bp,
+        accel_z_up_raw=acc_z_up,
+        velocity_z_up=vel_z,
+        displacement_z_up=disp_z,
+        roll_deg=roll_uniform,
+        pitch_deg=pitch_uniform,
+        fs_hz=fs,
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
