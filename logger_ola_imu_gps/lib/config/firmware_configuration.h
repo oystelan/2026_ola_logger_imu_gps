@@ -40,7 +40,13 @@ static constexpr int PIN_STAT_LED {19};
 // SD card pins
 
 static constexpr int SD_CS_PIN {23};
-static constexpr int SD_SPI_MHZ {50};
+// 24 MHz matches what the stock SparkFun OLA firmware uses on this hardware.
+// The earlier 50 MHz setting is the theoretical SDFat ceiling but on SHARED_SPI
+// mode (required because the ICM-20948 lives on the same bus) the per-
+// transaction tear-down at 50 MHz is fragile — slow cards retry or fall back
+// to a lower clock internally, which produced multi-second stalls. 24 MHz
+// gives ~24 MB/s peak which is >>200x our 7 KB/s payload rate.
+static constexpr int SD_SPI_MHZ {24};
 static constexpr int SD_PWR {15};
 
 //////////////////////////////////////////////////////////////////////////////////////////

@@ -156,28 +156,29 @@ bool SD_Card_Manager::preallocate_and_open_file(uint32_t size_bytes, bool use_fo
         return false;
     }
 
-    SDIrqGuard _guard;  // SD opens/preallocate do lots of SPI traffic — pause IMU ISR
-
     if (file_open) {
         close_and_sync_file();
     }
 
     generate_filename(use_folders);
-    
-    // Extract folder name from filename_buffer if using folders (format: BOOT_XXXXXX/DATA_BOOT_...)
+
+    // Extract folder name from filename_buffer if using folders.
     if (use_folders) {
-        char folder_name[32];  // "BOOT_XXXXXX" + null terminator
+        char folder_name[32];
         char* slash_pos = strchr(filename_buffer, '/');
         if (slash_pos != nullptr) {
             size_t folder_len = slash_pos - filename_buffer;
             strncpy(folder_name, filename_buffer, folder_len);
             folder_name[folder_len] = '\0';
-            
-            // Check if folder exists, create if it doesn't
-            if (!sd_card.exists(folder_name)) {
+
+            bool folder_exists;
+            { SDIrqGuard _guard; folder_exists = sd_card.exists(folder_name); }
+            if (!folder_exists) {
                 SERIAL_USB->print(F("Creating folder: "));
                 SERIAL_USB->println(folder_name);
-                if (!sd_card.mkdir(folder_name)) {
+                bool ok;
+                { SDIrqGuard _guard; ok = sd_card.mkdir(folder_name); }
+                if (!ok) {
                     SERIAL_USB->println(F("ERROR: Failed to create folder!"));
                     return false;
                 }
@@ -185,19 +186,23 @@ bool SD_Card_Manager::preallocate_and_open_file(uint32_t size_bytes, bool use_fo
             }
         }
     }
-    
+
     SERIAL_USB->print(F("Opening file: "));
     SERIAL_USB->println(filename_buffer);
-    
+
     // Try to remove old file first
-    if (sd_card.exists(filename_buffer)) {
+    bool existed;
+    { SDIrqGuard _guard; existed = sd_card.exists(filename_buffer); }
+    if (existed) {
         SERIAL_USB->println(F("WARNING: Removing old file..."));
+        SDIrqGuard _guard;
         sd_card.remove(filename_buffer);
     }
-    delay(500);
     wdt.restart();
-    
-    if (!sd_file.open(filename_buffer, O_RDWR | O_CREAT)) {
+
+    bool opened;
+    { SDIrqGuard _guard; opened = sd_file.open(filename_buffer, O_RDWR | O_CREAT); }
+    if (!opened) {
         SERIAL_USB->println(F("ERROR: Failed to open new file!"));
         SERIAL_USB->print(F("Error code: "));
         SERIAL_USB->println(sd_card.card()->errorCode(), HEX);
@@ -205,47 +210,61 @@ bool SD_Card_Manager::preallocate_and_open_file(uint32_t size_bytes, bool use_fo
         SERIAL_USB->println(sd_card.card()->errorData(), HEX);
         return false;
     }
-    delay(500);
     wdt.restart();
-    
+
     file_open = true;
     SERIAL_USB->println(F("File opened successfully"));
-    
-    // Truncate file to zero before preallocation
-    if (!sd_file.truncate(0)) {
+
+    // Truncate file to zero (clean slate if the file already existed).
+    bool truncated;
+    { SDIrqGuard _guard; truncated = sd_file.truncate(0); }
+    if (!truncated) {
         SERIAL_USB->println(F("WARNING: Failed to truncate file"));
     }
-    delay(500);
     wdt.restart();
-    
-    // Preallocate if size specified
-    if (size_bytes > 0) {
-        SERIAL_USB->print(F("Preallocating "));
-        SERIAL_USB->print(size_bytes);
-        SERIAL_USB->println(F(" bytes..."));
-        
-        // Restart watchdog before starting long preallocation
-        wdt.restart();
-        
-        if (!sd_file.preAllocate(size_bytes)) {
-            SERIAL_USB->println(F("WARNING: Failed to preallocate file!"));
-            SERIAL_USB->println(F("Continuing without preallocation..."));
-        } else {
-            SERIAL_USB->println(F("File preallocated successfully"));
-            wdt.restart();  // Restart after preallocation completes
-            sd_file.sync();  // Ensure FAT is updated
-        }
+
+    // Pre-allocate enough contiguous space for a full 15-min file at our
+    // ~6.75 KB/s data rate (~6 MB). SdFat's RingBuf requires the file to be
+    // fully pre-allocated for its expected lifetime — past the pre-allocated
+    // boundary, RingBuf's block-aligned writeOut path stops extending the
+    // file (BOOT_000106 stopped writing at ~150 s = exactly 1 MB / 7 KB/s
+    // with the previous 1 MB cap). 8 MB gives comfortable headroom for an
+    // entire 15-min file plus header overhead.
+    //
+    // Cost: one-shot ~1-2 s stall at file open. Trade-off accepted by the
+    // user; this happens once per 15-min file (0.17% of recording time).
+    // The original 12 MB was an over-sized leftover; 8 MB hits the same
+    // outcome without ~33% more SD activity per rotation.
+    //
+    // The `size_bytes` parameter is honored only as an upper bound; we
+    // never allocate more than PREALLOCATE_CHUNK_BYTES per call.
+    static constexpr uint32_t PREALLOCATE_CHUNK_BYTES = 8u * 1024 * 1024;
+    uint32_t alloc_size = size_bytes > 0
+        ? (size_bytes < PREALLOCATE_CHUNK_BYTES ? size_bytes : PREALLOCATE_CHUNK_BYTES)
+        : PREALLOCATE_CHUNK_BYTES;
+
+    SERIAL_USB->print(F("Preallocating "));
+    SERIAL_USB->print(alloc_size);
+    SERIAL_USB->println(F(" bytes..."));
+    wdt.restart();
+    bool prealloc_ok;
+    { SDIrqGuard _guard; prealloc_ok = sd_file.preAllocate(alloc_size); }
+    if (!prealloc_ok) {
+        SERIAL_USB->println(F("WARNING: Failed to preallocate file; "
+                              "continuing — writes may be slower."));
+    } else {
+        SERIAL_USB->println(F("File preallocated successfully"));
     }
-    delay(500);
     wdt.restart();
-    
-    // Initialize RingBuf with the opened file
+    { SDIrqGuard _guard; sd_file.sync(); }
+    wdt.restart();
+
+    // Initialize RingBuf with the opened file (pure pointer assignment, no SPI)
 #ifdef USE_RINGBUFF
     ring_buf.begin(&sd_file);
-    delay(500);
     wdt.restart();
 #endif
-    
+
     return true;
 }
 
@@ -254,26 +273,21 @@ void SD_Card_Manager::close_and_sync_file() {
         return;
     }
 
-    SDIrqGuard _guard;  // sync/close are long-running SD SPI ops; pause IMU ISR
-
     SERIAL_USB->println(F("Syncing and closing file..."));
-    
+
+    // Each of these is a separate SD SPI op. Wrap each individually so the
+    // IMU ISR can fire during inter-op bookkeeping / watchdog restarts.
 #ifdef USE_RINGBUFF
-    // Flush all data from RingBuf to file
-    ring_buf.sync();
-    delay(500);
+    { SDIrqGuard _guard; ring_buf.sync(); }
     wdt.restart();
 #endif
-    
-    sd_file.sync();
-    delay(500);
+
+    { SDIrqGuard _guard; sd_file.sync(); }
     wdt.restart();
 
-    sd_file.close();
+    { SDIrqGuard _guard; sd_file.close(); }
     file_open = false;
     SERIAL_USB->println(F("File closed"));
-    wdt.restart();
-    delay(500);
     wdt.restart();
 }
 
@@ -283,34 +297,51 @@ bool SD_Card_Manager::write_buffer(const uint8_t* buffer, size_t size) {
         return false;
     }
 
-    SDIrqGuard _guard;  // protect SD SPI writes from being preempted by IMU ISR
-
 #ifdef USE_RINGBUFF
     digitalWrite(PIN_STAT_LED, HIGH);
-    // Check if we need to flush before writing new data
-    // This ensures we don't overflow the buffer
-    // Do this BEFORE writing to avoid blocking after the write
+    // Two distinct phases here, only ONE of which actually touches SPI:
+    //   (a) ring_buf.writeOut(): flushes RAM ring buffer to the SD card
+    //       over SPI. THIS is the operation that contends with the IMU
+    //       SPI traffic — wrap it in SDIrqGuard so the IMU sample ISR
+    //       cannot preempt it mid-block.
+    //   (b) ring_buf.write(): a pure RAM copy from `buffer` into the ring
+    //       buffer. No SPI involved. The IMU ISR is welcome to fire during
+    //       this so gyro+mag stay fresh.
+    //
+    // Pre-refactor we wrapped the whole function in SDIrqGuard, which
+    // silenced the IMU ISR for ~200 ms per RingBuf drain. That windowed
+    // the gyro+mag flat-spots we kept seeing. Now the guard is just the
+    // ~3 ms of actual SD write time.
     if (ring_buf.bytesFree() < size + SD_RINGBUF_SIZE / 4) {
-        // Write out half the buffer to make room
-        // This performs SD writes but keeps ISR blocking minimal
-        // Restart watchdog as this can take time
+        // Time to drain a chunk of the ring buffer to the card.
+        //
+        // We pick a SMALL chunk (4 KB = 8 SD sectors) so the SDIrqGuard
+        // window stays short and the per-flush gyro/mag freeze is bounded
+        // by how long ~8 sectors take on the worst-case SD card (~40 ms
+        // when the card is doing internal GC; ~5 ms when it's not). The
+        // total IMU data rate is unchanged, so we just flush more often
+        // with shorter freezes per flush — much friendlier to gyro/mag.
+        // Previous value (SD_RINGBUF_SIZE / 2 = 16 KB) produced ~150 ms
+        // freezes every ~1.6 s.
+        static constexpr size_t WRITEOUT_BYTES = 4096;
         wdt.restart();
-
-        ring_buf.writeOut(SD_RINGBUF_SIZE / 2);
-
+        {
+            SDIrqGuard _guard;
+            ring_buf.writeOut(WRITEOUT_BYTES);
+        }
         wdt.restart();
     }
-    
-    // Write to RingBuf - the write() itself only briefly disables interrupts
-    // during the counter update (a few CPU cycles)
+
+    // RAM-only copy — IMU ISR may run freely here.
     size_t written = ring_buf.write(buffer, size);
     digitalWrite(PIN_STAT_LED, LOW);
 #else
-    // Direct write to SD card file
+    // Direct write to SD card file — needs the IRQ guard for the whole op.
     digitalWrite(PIN_STAT_LED, HIGH);
+    SDIrqGuard _guard;
     size_t written = sd_file.write(buffer, size);
     digitalWrite(PIN_STAT_LED, LOW);
 #endif
-    
+
     return (written == size);
 }

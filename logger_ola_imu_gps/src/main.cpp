@@ -1325,11 +1325,24 @@ void setup() {
     SERIAL_USB->println(posix_timestamp_next_file);
 
     // Persist the current UTC to EEPROM as a fallback for boards without a
-    // working coin cell. Only writes if the timestamp is plausibly real
-    // (year >= 2025) so we never overwrite a good cached value with the
-    // 1970 default. ~96 writes/day to one cell — Apollo3 EEPROM lasts years.
-    if (ENABLE_TIME_EEPROM_FALLBACK && posix_timestamp >= 1735689600UL /* 2025-01-01 */){
+    // working coin cell. Only writes if (a) the timestamp is plausibly real
+    // (year >= 2025) so we never overwrite a good cached value with the 1970
+    // default, AND (b) the previous EEPROM write happened more than
+    // EEPROM_TIME_WRITE_INTERVAL_S ago. Each save_last_known_posix() call is
+    // two flash erase+write cycles (~100-200 ms total during which the
+    // Apollo3 EEPROM lib internally masks all interrupts — including the
+    // IMU ISR), so calling it at every 15-min file rotation adds ~100-200 ms
+    // to the per-file gyro/mag freeze window. A 1-hour-old RTC seed is still
+    // perfectly useful as a next-boot fallback, so we batch the writes.
+    static constexpr uint32_t EEPROM_TIME_WRITE_INTERVAL_S = 3600;  // 1 h
+    static uint32_t last_eeprom_time_save = 0;
+    if (ENABLE_TIME_EEPROM_FALLBACK
+        && posix_timestamp >= 1735689600UL /* 2025-01-01 */
+        && (last_eeprom_time_save == 0
+            || posix_timestamp - last_eeprom_time_save >= EEPROM_TIME_WRITE_INTERVAL_S))
+    {
       calibration_manager.save_last_known_posix(posix_timestamp);
+      last_eeprom_time_save = posix_timestamp;
     }
     wdt.restart();
     SERIAL_USB->println(F("Logging..."));
