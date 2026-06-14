@@ -31,7 +31,11 @@ extern int memcmp(const void *, const void *, size_t); // Avoid compiler warning
 
 // Define if the DMP will be supported
 // Note: you must have 14290/14301 Bytes of program memory available to store the DMP firmware!
-//#define ICM_20948_USE_DMP // Uncomment this line to enable DMP support. You can of course use ICM_20948_USE_DMP as a compiler flag too
+// Re-enabled on the dmp-fifo-100hz branch — see the OLA logger main.cpp setup
+// for the DMP init + ISR drain wiring. The first attempt was reverted because
+// of a stream-mode FIFO wraparound bug and a destructive resetDMP() call; this
+// branch addresses both.
+#define ICM_20948_USE_DMP
 
 // There are two versions of the InvenSense DMP firmware for the ICM20948 - with slightly different sizes
 #define DMP_CODE_SIZE 14301 /* eMD-SmartMotion-ICM20948-1.1.0-MP */

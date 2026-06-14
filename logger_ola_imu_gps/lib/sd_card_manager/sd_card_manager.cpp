@@ -223,22 +223,27 @@ bool SD_Card_Manager::preallocate_and_open_file(uint32_t size_bytes, bool use_fo
     }
     wdt.restart();
 
-    // Pre-allocate enough contiguous space for a full 15-min file at our
-    // ~6.75 KB/s data rate (~6 MB). SdFat's RingBuf requires the file to be
-    // fully pre-allocated for its expected lifetime — past the pre-allocated
-    // boundary, RingBuf's block-aligned writeOut path stops extending the
-    // file (BOOT_000106 stopped writing at ~150 s = exactly 1 MB / 7 KB/s
-    // with the previous 1 MB cap). 8 MB gives comfortable headroom for an
-    // entire 15-min file plus header overhead.
+    // Pre-allocate enough contiguous space for a full 15-min file at the
+    // dmp-fifo-100hz branch's lower data rate. SdFat's RingBuf requires the
+    // file to be fully pre-allocated for its expected lifetime — past the
+    // pre-allocated boundary, RingBuf's block-aligned writeOut path stops
+    // extending the file (BOOT_000106 stopped writing at ~150 s = exactly
+    // 1 MB / 7 KB/s with a previous 1 MB cap).
     //
-    // Cost: one-shot ~1-2 s stall at file open. Trade-off accepted by the
-    // user; this happens once per 15-min file (0.17% of recording time).
-    // The original 12 MB was an over-sized leftover; 8 MB hits the same
-    // outcome without ~33% more SD activity per rotation.
+    // Data rate budget at 100 Hz, accel+gyro only (no mag) in DMP-FIFO:
+    //   100 Hz × 28 B/IMU_record  = 2800 B/s   (\nIMU marker + 24 B struct)
+    //   10 Hz × 44 B/GNSS_record  =  440 B/s
+    //   ~1 Hz × 8 B/PPS_record    =    8 B/s
+    //   + header text ~500 B at file open
+    //   total ~3.25 KB/s, so 15 min ≈ 2.93 MB.
+    // 3 MB pre-alloc just barely covers it; we round up to 4 MB so the file
+    // never runs out, even with a 15-min recording that goes slightly long
+    // because of crystal drift. 4 MB at 32 MHz ≈ ~500-800 ms — fits inside
+    // the chip's 1.86 s FIFO headroom with margin to spare.
     //
     // The `size_bytes` parameter is honored only as an upper bound; we
     // never allocate more than PREALLOCATE_CHUNK_BYTES per call.
-    static constexpr uint32_t PREALLOCATE_CHUNK_BYTES = 8u * 1024 * 1024;
+    static constexpr uint32_t PREALLOCATE_CHUNK_BYTES = 4u * 1024 * 1024;
     uint32_t alloc_size = size_bytes > 0
         ? (size_bytes < PREALLOCATE_CHUNK_BYTES ? size_bytes : PREALLOCATE_CHUNK_BYTES)
         : PREALLOCATE_CHUNK_BYTES;

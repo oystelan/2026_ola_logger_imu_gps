@@ -31,10 +31,15 @@ SFE_UBLOX_GNSS log_GNSS;
 // static constexpr uint32_t GNSS_FREQUENCY_HZ = 1;
 static constexpr uint32_t GNSS_FREQUENCY_HZ = 10;
 
-// ICM-20948 internal sample-rate is 1125 / (1 + SMPLRT_DIV); with div=4 the ODR is exactly 225 Hz on both
-// accelerometer and gyroscope. Pick this constant together with IMU_SMPLRT_DIV below.
-static constexpr float IMU_ODR_HZ = 225.0f;
-static constexpr uint16_t IMU_SMPLRT_DIV = 4;
+// ICM-20948 internal sample-rate is 1125 / (1 + SMPLRT_DIV). With div=10 the
+// accel ODR is 1125/11 = 102.27 Hz; we call it "100 Hz" everywhere for
+// brevity. Gyro ODR with the same div is 1100/11 = 100 Hz exactly. Picked at
+// this rate because the chip's 4 KB FIFO has to absorb the full 8 MB
+// preAllocate stall (~500-1000 ms on the user's SD card) at every file
+// rotation. At 100 Hz with DMP packets carrying accel+gyro+bias only (22 B
+// each), the FIFO holds ~1.86 s of data — comfortable margin for the stall.
+static constexpr float IMU_ODR_HZ = 100.0f;
+static constexpr uint16_t IMU_SMPLRT_DIV = 10;
 
 // Timer configuration
 static constexpr int TIMER_NUM = 2;
@@ -184,140 +189,161 @@ extern "C" void am_ctimer_isr(void)
       SERIAL_USB->print(F(";"));
     }
 
-    // Drain the ICM-20948 FIFO. The chip buffers ACCEL samples in its 4 KB
-    // FIFO at the configured ODR (225 Hz) while the MCU is busy (e.g. during
-    // SD writes when the CTIMER ISR is masked by SDIrqGuard). When this ISR
-    // resumes, we pull every accumulated sample out in one batch — no data
-    // loss across SD gaps.
+    // Drain the ICM-20948 DMP FIFO. The DMP firmware writes HEADERED packets
+    // (header bitmap + per-sensor data + footer) so byte alignment is
+    // unambiguous even with the slightly different accel/gyro sample clocks.
+    // At 100 Hz with our config (Accel + Gyro, no Compass) each packet is
+    // exactly Header(2) + Accel(6) + Gyro+bias(12) + Footer(2) = 22 bytes.
     //
-    // ACCEL ONLY in FIFO — 6 bytes per sample:
-    //   ACCEL_X_H, ACCEL_X_L, ACCEL_Y_H, ACCEL_Y_L, ACCEL_Z_H, ACCEL_Z_L
-    // (signed 16-bit big-endian, chip frame; remapped to body below.)
-    // Why not also gyro+mag? Because their ODRs are slightly different
-    // (gyro 1100/(1+div), accel 1125/(1+div)) — when both are in FIFO the
-    // chip writes each sensor's bytes independently as they become ready
-    // and they desync over time, corrupting the byte→sensor mapping.
-    // See BOOT_000292 ~28-37 s where accel data appeared in the gyro slot.
+    // The 4 KB on-chip FIFO buffers 4096/22 ≈ 186 packets = ~1.86 s of data,
+    // enough to ride out the worst-case SD preAllocate stall (~500-1000 ms)
+    // at every file rotation without losing a sample. The DMP firmware
+    // keeps writing into the FIFO even while CTIMER_IRQn is masked by
+    // SDIrqGuard, so SD-stall windows produce zero gyro/mag freeze.
     //
-    // Gyro and mag are read via getAGMT() once at the START of each ISR
-    // drain — i.e. their effective sample rate is the ISR rate. For the
-    // basin / vertical-AHRS workflow this is more than enough (slow
-    // motion). All N accel samples in a batch share the same gyro+mag.
-    //
-    // Timing: monotonic counter (next_sample_us += dt per sample) with a
-    // ±100 ms resync against micros() to bound drift, anchored on the
-    // first batch.
+    // BUG FIXES carried over from the first DMP attempt:
+    //   * resetDMP() is NEVER called at runtime — it nukes DMP firmware
+    //     state and we can't recover without re-init (BOOT_70 dead-stop
+    //     at 2.5s).
+    //   * Pre-check getFIFOcount() >= DMP_MAX_PACKET_BYTES before each
+    //     readDMPdataFromFIFO() — the lib's first read consumes the 2-byte
+    //     header before checking the body fits; pre-checking prevents that
+    //     header from being lost (BOOT_61 multi-second desyncs).
+    //   * Discard POST_RESET_DISCARD_PACKETS = 32 packets after every
+    //     reset (boot included) — the DMP firmware emits warmup garbage
+    //     during its internal resync (BOOT_78 zero-sample spike clusters).
+    //   * Drop packets where Raw_Accel = (0,0,0) — physically impossible
+    //     and the known DMP "glitch" signature (BOOT_75: 11 packets in
+    //     11106 had this pattern).
+    //   * On any non-Ok status, resetFIFO() (NOT resetDMP) and discard 32
+    //     packets to clear potential wraparound corruption.
     {
-      static constexpr uint8_t FIFO_SAMPLE_BYTES = 6;
       static constexpr unsigned long FIFO_SAMPLE_DT_US =
           (unsigned long)(1000000.0f / IMU_ODR_HZ + 0.5f);
+      // Max packet size when all our enabled sensors fire in the same
+      // DMP cycle. We pre-check FIFO has at least this many bytes before
+      // calling readDMPdataFromFIFO so the lib's header-then-body read
+      // path can't desync the FIFO on a partial packet.
+      static constexpr uint16_t DMP_MAX_PACKET_BYTES = 22;
+      static constexpr uint16_t POST_RESET_DISCARD_PACKETS = 32;
+      static constexpr uint16_t MAX_PACKETS_PER_ISR = 256;
 
-      uint16_t fifo_bytes = 0;
-      imu.getFIFOcount(&fifo_bytes);
-      uint16_t n_samples = fifo_bytes / FIFO_SAMPLE_BYTES;
-      // Cap at the physical FIFO size (4096 B / 6 B-per-sample ≈ 682). If
-      // getFIFOcount() ever returns an impossibly large value (observed in
-      // BOOT_000307: ~43k bytes → n_samples ~7200 → 32-second backward
-      // resync jump), clamp it so the timestamp logic stays sane.
-      static constexpr uint16_t FIFO_MAX_SAMPLES = 4096 / FIFO_SAMPLE_BYTES;
-      if (n_samples > FIFO_MAX_SAMPLES) n_samples = FIFO_MAX_SAMPLES;
-      if (n_samples > 0){
-        // Snapshot gyro + mag direct registers ONCE for this whole batch.
-        // getAGMT() reads accel too — wasted SPI, but harmless and keeps
-        // the API simple. We ignore the accel values from agmt and use the
-        // FIFO bytes for accel below.
-        imu.getAGMT();
-        int16_t gx_chip = imu.agmt.gyr.axes.x;
-        int16_t gy_chip = imu.agmt.gyr.axes.y;
-        int16_t gz_chip = imu.agmt.gyr.axes.z;
-        int16_t mx_chip = imu.agmt.mag.axes.x;
-        int16_t my_chip = imu.agmt.mag.axes.y;
-        int16_t mz_chip = imu.agmt.mag.axes.z;
+      // Per-ISR static state
+      static int16_t last_gx_chip {0};
+      static int16_t last_gy_chip {0};
+      static int16_t last_gz_chip {0};
+      static unsigned long next_sample_us = 0;
+      static bool first_batch = true;
+      static uint16_t skip_packets_after_reset = POST_RESET_DISCARD_PACKETS;  // discard boot warmup
 
-        // ---- chip → PCB body GYRO remap ----
-        // GYRO die orientation = PCB silkscreen orientation, all three axes
-        // (verified by rotation test). Accel die is in a DIFFERENT orientation
-        // and gets the cyclic remap further down.
-        //   PCB_gx = +chip_gx
-        //   PCB_gy = +chip_gy
-        //   PCB_gz = +chip_gz
-        // Bias is stored in PCB body frame (= raw chip frame here); re-run gyro
-        // cal (quadruple-tap RESET) after flashing — any previously stored bias
-        // was in the wrong frame.
-        int16_t gx = (int16_t)(gx_chip - g_gyro_bias_x);
-        int16_t gy = (int16_t)(gy_chip - g_gyro_bias_y);
-        int16_t gz = (int16_t)(gz_chip - g_gyro_bias_z);
+      // Monotonic timestamp + ±100 ms forward-resync (same as plain-FIFO version)
+      unsigned long now_us = micros();
+      const unsigned long lag_threshold_us = 100000;  // 100 ms
+      if (first_batch || (next_sample_us + lag_threshold_us < now_us)){
+        next_sample_us = now_us;
+        first_batch = false;
+      }
 
-        // Mag axis mapping is chip-frame pass-through — verified by the
-        // orientation test (BOOT_000362): chip-mx/my/mz already match the
-        // PCB silkscreen mag arrows in both direction and sign. Only the
-        // hard-iron offset is subtracted; the full y/z flip relative to the
-        // accel/gyro silkscreen cross is handled downstream.
-        int16_t mx = (int16_t)(mx_chip - g_mag_bias_x);
-        int16_t my = (int16_t)(my_chip - g_mag_bias_y);
-        int16_t mz = (int16_t)(mz_chip - g_mag_bias_z);
+      uint16_t n_packets_drained = 0;
+      while (n_packets_drained < MAX_PACKETS_PER_ISR){
+        // Pre-check: only call readDMPdataFromFIFO when a full packet is
+        // guaranteed to be in FIFO. The lib's first SPI read consumes the
+        // 2-byte header even if the body bytes aren't ready — pre-checking
+        // makes that impossible.
+        uint16_t fifo_avail = 0;
+        imu.getFIFOcount(&fifo_avail);
+        if (fifo_avail < DMP_MAX_PACKET_BYTES) break;
 
-        unsigned long now_us = micros();
-        uint8_t buf[FIFO_SAMPLE_BYTES];
+        icm_20948_DMP_data_t pkt;
+        imu.readDMPdataFromFIFO(&pkt);
+        const ICM_20948_Status_e s = imu.status;
 
-        // Monotonic timestamp counter. Guarantees:
-        //   (a) micros_reading strictly increases sample-to-sample (no
-        //       backward jumps even if getFIFOcount() returns garbage)
-        //   (b) drift vs micros() is bounded (snap forward on lag)
-        // First batch: anchor at now_us. On lag > 100 ms: snap forward to
-        // now_us, NEVER backward. The trade-off: when the chip has
-        // accumulated samples during a long SD-block, their timestamps get
-        // clustered near the recovery moment rather than spread back over
-        // when they were taken — but they stay monotonic, and the AHRS
-        // resampler tolerates this small inaccuracy fine.
-        static unsigned long next_sample_us = 0;
-        static bool first_batch = true;
-        const unsigned long lag_threshold_us = 100000;  // 100 ms
-
-        if (first_batch || (next_sample_us + lag_threshold_us < now_us)){
-          next_sample_us = now_us;
-          first_batch = false;
+        // Any unexpected status — overflow / corrupt header / etc. — means
+        // we'd best dump the FIFO and re-sync. resetFIFO() is safe at
+        // runtime; resetDMP() is not (it kills the firmware state).
+        if (s != ICM_20948_Stat_Ok && s != ICM_20948_Stat_FIFOMoreDataAvail){
+          imu.resetFIFO();
+          skip_packets_after_reset = POST_RESET_DISCARD_PACKETS;
+          first_batch = true;
+          break;
         }
 
-        for (uint16_t i = 0; i < n_samples; i++){
-          imu.readFIFO(buf, FIFO_SAMPLE_BYTES);
-
-          // ACCEL bytes from FIFO (chip frame, big-endian int16)
-          int16_t ax_chip = (int16_t)((buf[0] << 8) | buf[1]);
-          int16_t ay_chip = (int16_t)((buf[2] << 8) | buf[3]);
-          int16_t az_chip = (int16_t)((buf[4] << 8) | buf[5]);
-
-          // chip → PCB body remap: PCB_x = chip_z, PCB_y = chip_x, PCB_z = chip_y
-          int16_t ax = az_chip;
-          int16_t ay = ax_chip;
-          int16_t az = ay_chip;
-
-          common_isr_imu_reading.micros_reading = next_sample_us;
-          next_sample_us += FIFO_SAMPLE_DT_US;
-          common_isr_imu_reading.counter = imu_isr_count;
-          imu_isr_count++;
-          common_isr_imu_reading.acc_x = ax;
-          common_isr_imu_reading.acc_y = ay;
-          common_isr_imu_reading.acc_z = az;
-          common_isr_imu_reading.gyr_x = gx;
-          common_isr_imu_reading.gyr_y = gy;
-          common_isr_imu_reading.gyr_z = gz;
-          common_isr_imu_reading.mag_x = mx;
-          common_isr_imu_reading.mag_y = my;
-          common_isr_imu_reading.mag_z = mz;
-
-          if (deque_IMU_readings.full()){
-            deque_IMU_readings.pop_front();
-          }
-          deque_IMU_readings.push_back(common_isr_imu_reading);
-          number_imu_samples_logged++;
+        // Discard the first packets after a reset — they tend to be DMP
+        // warmup garbage (acc zero, gyro huge spikes) while the chip
+        // re-populates internal state.
+        if (skip_packets_after_reset > 0){
+          skip_packets_after_reset--;
+          if (s != ICM_20948_Stat_FIFOMoreDataAvail) break;
+          continue;
         }
 
-        if (ENABLE_DEBUG_FASTPRINT){
-          SERIAL_USB->print(F("DI"));
-          SERIAL_USB->print(n_samples);
-          SERIAL_USB->print(F(";"));
+        // We only emit if the packet carries accel data — at our config
+        // every packet should — but guard.
+        if (!(pkt.header & DMP_header_bitmap_Accel)){
+          if (s != ICM_20948_Stat_FIFOMoreDataAvail) break;
+          continue;
         }
+
+        // Drop the "DMP-glitch" packet: raw accel exactly (0,0,0). Gravity
+        // is always present (~16384 LSB at gpm2 for 1g) and even chip
+        // noise is non-zero, so an exact-zero triple is the known DMP
+        // garbage signature, observed at ~0.1% of packets.
+        if (pkt.Raw_Accel.Data.X == 0
+            && pkt.Raw_Accel.Data.Y == 0
+            && pkt.Raw_Accel.Data.Z == 0){
+          if (s != ICM_20948_Stat_FIFOMoreDataAvail) break;
+          continue;
+        }
+
+        // ---- GYRO: update cached chip-frame values if present, else reuse ----
+        if (pkt.header & DMP_header_bitmap_Gyro){
+          last_gx_chip = pkt.Raw_Gyro.Data.X;
+          last_gy_chip = pkt.Raw_Gyro.Data.Y;
+          last_gz_chip = pkt.Raw_Gyro.Data.Z;
+        }
+        const int16_t gx = (int16_t)(last_gx_chip - g_gyro_bias_x);
+        const int16_t gy = (int16_t)(last_gy_chip - g_gyro_bias_y);
+        const int16_t gz = (int16_t)(last_gz_chip - g_gyro_bias_z);
+
+        // ---- ACCEL chip→PCB body remap: same as previous DMP path ----
+        // Empirical from BOOT_63: the DMP outputs accel such that
+        // pkt.Raw_Accel.Data.X carries the gravity-axis reading. Identity
+        // remap puts gravity on PCB_x.
+        const int16_t ax = pkt.Raw_Accel.Data.X;
+        const int16_t ay = pkt.Raw_Accel.Data.Y;
+        const int16_t az = pkt.Raw_Accel.Data.Z;
+
+        common_isr_imu_reading.micros_reading = next_sample_us;
+        next_sample_us += FIFO_SAMPLE_DT_US;
+        common_isr_imu_reading.counter = imu_isr_count;
+        imu_isr_count++;
+        common_isr_imu_reading.acc_x = ax;
+        common_isr_imu_reading.acc_y = ay;
+        common_isr_imu_reading.acc_z = az;
+        common_isr_imu_reading.gyr_x = gx;
+        common_isr_imu_reading.gyr_y = gy;
+        common_isr_imu_reading.gyr_z = gz;
+        // Mag is intentionally not in the DMP-FIFO on this branch; zero
+        // the on-disk struct fields so existing decoders still read the
+        // 24-byte IMU record but show "no mag data" to the user.
+        common_isr_imu_reading.mag_x = 0;
+        common_isr_imu_reading.mag_y = 0;
+        common_isr_imu_reading.mag_z = 0;
+
+        if (deque_IMU_readings.full()){
+          deque_IMU_readings.pop_front();
+        }
+        deque_IMU_readings.push_back(common_isr_imu_reading);
+        number_imu_samples_logged++;
+        n_packets_drained++;
+
+        if (s != ICM_20948_Stat_FIFOMoreDataAvail) break;
+      }
+
+      if (ENABLE_DEBUG_FASTPRINT){
+        SERIAL_USB->print(F("DI"));
+        SERIAL_USB->print(n_packets_drained);
+        SERIAL_USB->print(F(";"));
       }
     }
 
@@ -651,6 +677,13 @@ void setup() {
   // check knows whether the seed was authoritative enough to compare against.
   {
     kiss_time_t const hw_rtc_posix = board_time_manager.read_hw_rtc_posix();
+    // Diagnostic: always print the RAW H/W RTC reading so a reset-vs-power-cycle
+    // test can tell whether VBAT (coin cell) is actually preserving the RTC.
+    // If this is 0/garbage after a full power-off but valid after a plain
+    // reset, the coin cell is not holding up the VBAT rail.
+    SERIAL_USB->print(F("[diag] raw H/W RTC posix at boot: "));
+    SERIAL_USB->println(hw_rtc_posix);
+
     if (hw_rtc_posix != 0){
       board_time_manager.set_posix_timestamp(hw_rtc_posix);
       g_posix_seeded_from_hw_rtc = true;
@@ -659,7 +692,15 @@ void setup() {
     } else if (ENABLE_TIME_EEPROM_FALLBACK && calibration_manager.has_last_known_posix()){
       uint32_t const eeprom_posix = calibration_manager.load_last_known_posix();
       board_time_manager.set_posix_timestamp(eeprom_posix);
-      SERIAL_USB->print(F("RTC seeded from EEPROM fallback (last known UTC): "));
+      // Bootstrap the H/W RTC from the EEPROM fallback. Previously the H/W RTC
+      // was only ever written on a GNSS fix, so a GPS-less boot left the RTC
+      // un-seeded and every subsequent power-cycle fell through to EEPROM
+      // again. Writing it here means that — IF the coin cell is good — the
+      // next reset/power-cycle will read a valid RTC (path 1 above) and the
+      // time will advance correctly across power-offs even without GPS.
+      board_time_manager.write_hw_rtc_posix(eeprom_posix);
+      SERIAL_USB->print(F("RTC seeded from EEPROM fallback (last known UTC), "
+                          "and written into H/W RTC: "));
       SERIAL_USB->println(eeprom_posix);
     } else {
       board_time_manager.set_posix_timestamp(0);
@@ -919,32 +960,15 @@ void setup() {
     }
     wdt.restart();
 
-    // ---------- Enable the on-chip FIFO for accel + gyro ----------
-    // Why: when the main MCU is busy writing to the SD card, the CTIMER ISR
-    // is masked (see SDIrqGuard) and we used to lose every IMU sample for
-    // the entire SD-flush window (≥700 ms in practice). With the FIFO on,
-    // the ICM-20948 keeps buffering samples in its 4 KB FIFO at the
-    // configured ODR while the MCU is "deaf". When the CTIMER ISR resumes
-    // it drains everything in one go, so the recorded time series has no
-    // gaps even across long SD pauses. Per-sample size below is 12 bytes
-    // (6 accel + 6 gyro, no temp, no mag), so 4 KB holds ≈ 341 samples,
-    // i.e. ≈ 1.5 s of buffer headroom at 225 Hz.
-    imu.enableFIFO(false);                              // disable while reconfiguring
-    // ACCEL ONLY in FIFO. With BOTH accel (1125/5=225Hz) and gyro (1100/5=220Hz)
-    // in FIFO, the chip writes each sensor's 6 bytes INDEPENDENTLY at its own
-    // rate — they don't form synchronised 12-byte frames. Over time the byte
-    // positions of accel vs gyro drift within each 12-byte read, eventually
-    // putting accel bytes into the gyro slot (verified in BOOT_000292 ~30s).
-    // Solution: only accel in FIFO; gyro+mag read via direct registers once
-    // per ISR drain and applied to the whole batch. Per-sample size = 6 B.
-    imu.setFIFOdataAccelGyroTemp(true, false, false);   // accel only
-    imu.setFIFOmode(false);                             // stream mode
+    // ---------- FIFO off during calibration phase ----------
+    // Calibration paths below read via getAGMT() (direct registers, no
+    // FIFO). DMP-mode FIFO setup happens further down, AFTER calibration —
+    // initializeDMP() reconfigures I2C_SLV0 for its own mag-read path, which
+    // would break getAGMT()'s mag values if DMP were brought up earlier.
+    imu.enableFIFO(false);
     imu.resetFIFO();
-    imu.enableFIFO(true);
-    SERIAL_USB->print(F("ICM-20948 FIFO enabled (accel only), 6 B/sample: "));
-    SERIAL_USB->println(imu.statusString());
 
-    // FIFO register sanity check (one-shot at boot)
+    // Register sanity check
     {
       uint8_t v;
       imu.debugReadReg(0, 0x67, &v); SERIAL_USB->print(F("[boot] FIFO_EN_2=0x")); SERIAL_USB->print(v, HEX);
@@ -1208,6 +1232,76 @@ void setup() {
       imu.resetFIFO();
       wdt.restart();
     }
+
+    ////////////////////////////////////////////////////
+    // ---------- DMP-mode FIFO for accel + gyro at 100 Hz ----------
+    //
+    // We put accel and gyro into the chip's hardware FIFO via the DMP
+    // firmware. The DMP writes HEADERED packets, so byte alignment is
+    // unambiguous even with the slightly different sample clocks (~225 Hz
+    // accel vs ~220 Hz gyro at our div). At 100 Hz with 22 B/packet (Header
+    // 2 + Accel 6 + Gyro+bias 12 + Footer 2) the data rate is 2.2 KB/s and
+    // the 4 KB FIFO buffers ~1.86 s — enough to ride out the worst-case SD
+    // preAllocate stall (~500-1000 ms) at every file rotation without losing
+    // a sample.
+    //
+    // Mag is intentionally NOT in the FIFO: the user disabled it to free up
+    // packet bytes (and AK09916 is capped at 100 Hz internally anyway, so
+    // adding it would have given us at-most-100 Hz mag values for an extra
+    // 6 B/packet that we don't have the headroom for). The IMU_reading
+    // struct's mag_* fields are zeroed in the ISR — the on-disk binary
+    // format is unchanged and the decoder still loads without modification.
+    //
+    // Init order: AFTER the gyro/mag calibration paths above. initializeDMP()
+    // reconfigures I2C_SLV0 for its own (InvenSense "secret-sauce") mag-read
+    // path, which would have broken getAGMT()'s mag readings if DMP came up
+    // before calibration.
+    //
+    // Bug fixes carried over from the first DMP attempt (BOOT_70-85):
+    //   * resetDMP() is NEVER called at runtime — it nukes DMP firmware
+    //     state and we have no clean way to re-init from inside the ISR.
+    //     resetFIFO() alone is enough to clear stream-mode wraparound.
+    //   * Pre-check getFIFOcount() before each readDMPdataFromFIFO() so the
+    //     lib's header-consuming first read can't desync the FIFO on a
+    //     partial-packet read.
+    //   * Discard the first 32 packets after every reset (boot included) —
+    //     the DMP firmware emits warmup garbage during its internal resync.
+    //   * Drop packets where Raw_Accel = (0,0,0) — physically impossible
+    //     and a known DMP glitch signature.
+    SERIAL_USB->print(F("ICM-20948 initializeDMP: "));
+    ICM_20948_Status_e dmp_init_status = imu.initializeDMP();
+    SERIAL_USB->println(imu.statusString(dmp_init_status));
+
+    // Override stock DMP defaults (55 Hz, gpm4/dps2000) with our values.
+    {
+      ICM_20948_smplrt_t dmp_smplrt;
+      dmp_smplrt.a = IMU_SMPLRT_DIV;
+      dmp_smplrt.g = IMU_SMPLRT_DIV;
+      imu.setSampleRate((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), dmp_smplrt);
+    }
+    {
+      ICM_20948_fss_t dmp_fss;
+      dmp_fss.a = gpm2;
+      dmp_fss.g = dps250;
+      imu.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), dmp_fss);
+    }
+
+    // Enable RAW accel + RAW gyro. NO compass — see the comment block above.
+    imu.enableDMPSensor(INV_ICM20948_SENSOR_RAW_ACCELEROMETER);
+    imu.enableDMPSensor(INV_ICM20948_SENSOR_RAW_GYROSCOPE);
+
+    // Output each enabled sensor on every DMP cycle (max rate)
+    imu.setDMPODRrate(DMP_ODR_Reg_Accel, 0);
+    imu.setDMPODRrate(DMP_ODR_Reg_Gyro,  0);
+
+    imu.enableFIFO();
+    imu.enableDMP();
+    imu.resetDMP();      // safe at SETUP (it's part of the init sequence)
+    imu.resetFIFO();
+
+    SERIAL_USB->print(F("ICM-20948 DMP enabled (accel+gyro @100Hz, no mag): "));
+    SERIAL_USB->println(imu.statusString());
+    wdt.restart();
 
     ////////////////////////////////////////////////////
     SERIAL_USB->println(F("Configuring (but NOT yet starting) IMU sample timer..."));

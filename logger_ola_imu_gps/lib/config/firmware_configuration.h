@@ -40,13 +40,12 @@ static constexpr int PIN_STAT_LED {19};
 // SD card pins
 
 static constexpr int SD_CS_PIN {23};
-// 24 MHz matches what the stock SparkFun OLA firmware uses on this hardware.
-// The earlier 50 MHz setting is the theoretical SDFat ceiling but on SHARED_SPI
-// mode (required because the ICM-20948 lives on the same bus) the per-
-// transaction tear-down at 50 MHz is fragile — slow cards retry or fall back
-// to a lower clock internally, which produced multi-second stalls. 24 MHz
-// gives ~24 MB/s peak which is >>200x our 7 KB/s payload rate.
-static constexpr int SD_SPI_MHZ {24};
+// 32 MHz: middle ground between the stock 24 MHz and the over-aggressive
+// 50 MHz. At 32 MHz the SHARED_SPI per-transaction tear-down still completes
+// reliably on slow cards but the actual SD writes (notably preAllocate) get
+// ~33% faster than at 24 MHz, which helps fit the per-file-rotation stall
+// inside the chip's 4 KB DMP-FIFO buffer (~1.86 s at 100 Hz).
+static constexpr int SD_SPI_MHZ {32};
 static constexpr int SD_PWR {15};
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -55,7 +54,15 @@ static constexpr int SD_PWR {15};
 static constexpr int PIN_IMU_CHIP_SELECT {44};
 static constexpr int PIN_IMU_POWER {27};
 static constexpr int PIN_IMU_INT {37};
-static constexpr int IMU_SPI_MHZ {4};
+// 2 MHz is the conservative production setting. A/B comparison on static
+// recordings (BOOT_120 at 1 MHz vs BOOT_123 at 4 MHz) found virtually no
+// difference in spike rate or noise floor — meaning at static conditions
+// the MISO pull-up workaround is enough at 4 MHz and the SPI clock isn't
+// the bottleneck. We hold at 2 MHz anyway for a 2x rise-time safety margin
+// against unit-to-unit PCB tolerances, supply variation across rechargeable
+// batteries, and temperature. Per-packet SPI time at 2 MHz (~88 us) is
+// still <1% of the 10 ms inter-packet budget at 100 Hz so there's no cost.
+static constexpr int IMU_SPI_MHZ {2};
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // Time-persistence behaviour
