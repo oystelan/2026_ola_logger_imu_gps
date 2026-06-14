@@ -233,15 +233,38 @@ extern "C" void am_ctimer_isr(void)
       static int16_t last_gy_chip {0};
       static int16_t last_gz_chip {0};
       static unsigned long next_sample_us = 0;
+      static unsigned long last_emitted_us = 0;
       static bool first_batch = true;
       static uint16_t skip_packets_after_reset = POST_RESET_DISCARD_PACKETS;  // discard boot warmup
 
-      // Monotonic timestamp + ±100 ms forward-resync (same as plain-FIFO version)
+      // --- Timestamp tracking loop (locks sample time to real micros()) ---
+      // The DMP emits accel at 1125/(1+SMPLRT_DIV) = 102.27 Hz, but we advance
+      // the per-sample timestamp by FIFO_SAMPLE_DT_US = 1e6/IMU_ODR_HZ (= 100
+      // Hz). That 2.27% rate mismatch made the old forward-only resync useless
+      // (the counter runs *fast*, never lags) so the IMU timeline drifted
+      // ahead of real/UTC time without bound — ~2% over a couple of minutes
+      // (diagnosed against the co-located SFY buoy in BOOT_000000).
+      //
+      // Fix: a first-order software PLL. Each ISR we nudge next_sample_us a
+      // fraction of the way toward the real hardware micros() (which is itself
+      // GPS-disciplined downstream via the GNSS→UTC fit). This locks the
+      // *average* sample rate to the true clock regardless of the exact DMP
+      // rate, while the per-sample += dt keeps spacing smooth between
+      // corrections. Signed (int32) diff handles the uint32 micros() wrap.
+      // A monotonicity clamp guarantees timestamps never step backward past
+      // the last emitted sample.
       unsigned long now_us = micros();
-      const unsigned long lag_threshold_us = 100000;  // 100 ms
-      if (first_batch || (next_sample_us + lag_threshold_us < now_us)){
+      if (first_batch){
         next_sample_us = now_us;
+        last_emitted_us = now_us - FIFO_SAMPLE_DT_US;  // so first sample > nothing
         first_batch = false;
+      } else {
+        int32_t err = (int32_t)(now_us - next_sample_us);
+        next_sample_us += err / 16;   // ~80 ms time-constant at the 200 Hz ISR
+        // Never let the correction step behind an already-emitted timestamp.
+        if ((int32_t)(next_sample_us - last_emitted_us) <= 0){
+          next_sample_us = last_emitted_us + 1;
+        }
       }
 
       uint16_t n_packets_drained = 0;
@@ -314,6 +337,7 @@ extern "C" void am_ctimer_isr(void)
         const int16_t az = pkt.Raw_Accel.Data.Z;
 
         common_isr_imu_reading.micros_reading = next_sample_us;
+        last_emitted_us = next_sample_us;
         next_sample_us += FIFO_SAMPLE_DT_US;
         common_isr_imu_reading.counter = imu_isr_count;
         imu_isr_count++;
