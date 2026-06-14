@@ -232,43 +232,31 @@ extern "C" void am_ctimer_isr(void)
       static int16_t last_gx_chip {0};
       static int16_t last_gy_chip {0};
       static int16_t last_gz_chip {0};
-      static unsigned long next_sample_us = 0;
       static unsigned long last_emitted_us = 0;
-      static bool first_batch = true;
+      static bool first_emit = true;
       static uint16_t skip_packets_after_reset = POST_RESET_DISCARD_PACKETS;  // discard boot warmup
 
-      // --- Timestamp tracking loop (locks sample time to real micros()) ---
-      // The DMP emits accel at 1125/(1+SMPLRT_DIV) = 102.27 Hz, but we advance
-      // the per-sample timestamp by FIFO_SAMPLE_DT_US = 1e6/IMU_ODR_HZ (= 100
-      // Hz). That 2.27% rate mismatch made the old forward-only resync useless
-      // (the counter runs *fast*, never lags) so the IMU timeline drifted
-      // ahead of real/UTC time without bound — ~2% over a couple of minutes
-      // (diagnosed against the co-located SFY buoy in BOOT_000000).
-      //
-      // Fix: a first-order software PLL. Each ISR we nudge next_sample_us a
-      // fraction of the way toward the real hardware micros() (which is itself
-      // GPS-disciplined downstream via the GNSS→UTC fit). This locks the
-      // *average* sample rate to the true clock regardless of the exact DMP
-      // rate, while the per-sample += dt keeps spacing smooth between
-      // corrections. Signed (int32) diff handles the uint32 micros() wrap.
-      // A monotonicity clamp guarantees timestamps never step backward past
-      // the last emitted sample.
-      unsigned long now_us = micros();
-      if (first_batch){
-        next_sample_us = now_us;
-        last_emitted_us = now_us - FIFO_SAMPLE_DT_US;  // so first sample > nothing
-        first_batch = false;
-      } else {
-        int32_t err = (int32_t)(now_us - next_sample_us);
-        next_sample_us += err / 16;   // ~80 ms time-constant at the 200 Hz ISR
-        // Never let the correction step behind an already-emitted timestamp.
-        if ((int32_t)(next_sample_us - last_emitted_us) <= 0){
-          next_sample_us = last_emitted_us + 1;
-        }
-      }
+      // Local per-ISR buffer for the parsed samples drained THIS ISR. Static
+      // (not on the ISR stack) to keep stack use low; not re-entrant, which is
+      // fine — the CTIMER ISR cannot preempt itself. 6 int16 per sample.
+      static int16_t b_ax[MAX_PACKETS_PER_ISR], b_ay[MAX_PACKETS_PER_ISR], b_az[MAX_PACKETS_PER_ISR];
+      static int16_t b_gx[MAX_PACKETS_PER_ISR], b_gy[MAX_PACKETS_PER_ISR], b_gz[MAX_PACKETS_PER_ISR];
 
-      uint16_t n_packets_drained = 0;
-      while (n_packets_drained < MAX_PACKETS_PER_ISR){
+      // --- Timestamping: anchor each batch to the real hardware micros() ---
+      // The DMP emits accel at 1125/(1+SMPLRT_DIV) = 102.27 Hz; FIFO_SAMPLE_DT_US
+      // (1e6/IMU_ODR_HZ = 100 Hz) is only used for INTRA-batch spacing of the
+      // rare multi-sample post-stall drains. The CTIMER ISR fires at 2x ODR
+      // (~200 Hz) so a normal ISR drains 0 or 1 samples; the single sample is
+      // stamped with now_us = micros() directly, locking the timeline to the
+      // GPS-disciplined hardware clock with ZERO rate bias. (The earlier free-
+      // running 100 Hz counter drifted +2.27%; a PLL replacement still left
+      // +0.7% because its monotonicity clamp fought the pull-back. Direct
+      // per-batch micros() anchoring has neither problem.)
+      unsigned long now_us = micros();
+
+      // ---- Phase 1: drain all available packets into the local buffer ----
+      uint16_t n_batch = 0;
+      while (n_batch < MAX_PACKETS_PER_ISR){
         // Pre-check: only call readDMPdataFromFIFO when a full packet is
         // guaranteed to be in FIFO. The lib's first SPI read consumes the
         // 2-byte header even if the body bytes aren't ready — pre-checking
@@ -287,7 +275,6 @@ extern "C" void am_ctimer_isr(void)
         if (s != ICM_20948_Stat_Ok && s != ICM_20948_Stat_FIFOMoreDataAvail){
           imu.resetFIFO();
           skip_packets_after_reset = POST_RESET_DISCARD_PACKETS;
-          first_batch = true;
           break;
         }
 
@@ -324,29 +311,43 @@ extern "C" void am_ctimer_isr(void)
           last_gy_chip = pkt.Raw_Gyro.Data.Y;
           last_gz_chip = pkt.Raw_Gyro.Data.Z;
         }
-        const int16_t gx = (int16_t)(last_gx_chip - g_gyro_bias_x);
-        const int16_t gy = (int16_t)(last_gy_chip - g_gyro_bias_y);
-        const int16_t gz = (int16_t)(last_gz_chip - g_gyro_bias_z);
+        b_gx[n_batch] = (int16_t)(last_gx_chip - g_gyro_bias_x);
+        b_gy[n_batch] = (int16_t)(last_gy_chip - g_gyro_bias_y);
+        b_gz[n_batch] = (int16_t)(last_gz_chip - g_gyro_bias_z);
 
         // ---- ACCEL chip→PCB body remap: same as previous DMP path ----
         // Empirical from BOOT_63: the DMP outputs accel such that
         // pkt.Raw_Accel.Data.X carries the gravity-axis reading. Identity
         // remap puts gravity on PCB_x.
-        const int16_t ax = pkt.Raw_Accel.Data.X;
-        const int16_t ay = pkt.Raw_Accel.Data.Y;
-        const int16_t az = pkt.Raw_Accel.Data.Z;
+        b_ax[n_batch] = pkt.Raw_Accel.Data.X;
+        b_ay[n_batch] = pkt.Raw_Accel.Data.Y;
+        b_az[n_batch] = pkt.Raw_Accel.Data.Z;
+        n_batch++;
 
-        common_isr_imu_reading.micros_reading = next_sample_us;
-        last_emitted_us = next_sample_us;
-        next_sample_us += FIFO_SAMPLE_DT_US;
+        if (s != ICM_20948_Stat_FIFOMoreDataAvail) break;
+      }
+
+      // ---- Phase 2: stamp + push. Newest sample of the batch gets now_us;
+      // earlier samples spread backward by FIFO_SAMPLE_DT_US. Monotonicity
+      // clamp keeps timestamps strictly increasing across ISRs. ----
+      for (uint16_t k = 0; k < n_batch; k++){
+        unsigned long ts = now_us - (unsigned long)(n_batch - 1 - k) * FIFO_SAMPLE_DT_US;
+        if (first_emit){
+          first_emit = false;
+        } else if ((int32_t)(ts - last_emitted_us) <= 0){
+          ts = last_emitted_us + 1;
+        }
+        last_emitted_us = ts;
+
+        common_isr_imu_reading.micros_reading = ts;
         common_isr_imu_reading.counter = imu_isr_count;
         imu_isr_count++;
-        common_isr_imu_reading.acc_x = ax;
-        common_isr_imu_reading.acc_y = ay;
-        common_isr_imu_reading.acc_z = az;
-        common_isr_imu_reading.gyr_x = gx;
-        common_isr_imu_reading.gyr_y = gy;
-        common_isr_imu_reading.gyr_z = gz;
+        common_isr_imu_reading.acc_x = b_ax[k];
+        common_isr_imu_reading.acc_y = b_ay[k];
+        common_isr_imu_reading.acc_z = b_az[k];
+        common_isr_imu_reading.gyr_x = b_gx[k];
+        common_isr_imu_reading.gyr_y = b_gy[k];
+        common_isr_imu_reading.gyr_z = b_gz[k];
         // Mag is intentionally not in the DMP-FIFO on this branch; zero
         // the on-disk struct fields so existing decoders still read the
         // 24-byte IMU record but show "no mag data" to the user.
@@ -359,14 +360,11 @@ extern "C" void am_ctimer_isr(void)
         }
         deque_IMU_readings.push_back(common_isr_imu_reading);
         number_imu_samples_logged++;
-        n_packets_drained++;
-
-        if (s != ICM_20948_Stat_FIFOMoreDataAvail) break;
       }
 
       if (ENABLE_DEBUG_FASTPRINT){
         SERIAL_USB->print(F("DI"));
-        SERIAL_USB->print(n_packets_drained);
+        SERIAL_USB->print(n_batch);
         SERIAL_USB->print(F(";"));
       }
     }
