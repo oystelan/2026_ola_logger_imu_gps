@@ -31,12 +31,23 @@ from ahrs_vertical import (
     compute_vertical_motion_lowpass_gravity,
     compute_vertical_motion_savgol_detrend,
 )
-from decoder import decode_file, load_data_as_arrays
+from plot_raw_accel import find_default_path, load_data_from_path, _clip_initial_seconds
 
 
 # Frequency band of motion-of-interest. Tune to your basin / wave setup.
-LOW_HZ = 0.2
+LOW_HZ = 0.1
 HIGH_HZ = 5.
+
+# Drop this many seconds from the start of the recording before running the
+# AHRS. The DMP firmware emits warmup garbage for ~1-2 s after boot; feeding
+# that into the attitude bootstrap / integration corrupts the whole result.
+SKIP_START_S = 1.5
+
+# Seconds at the start of the (post-skip) recording used to determine which
+# body axis gravity is on, so we can rotate it onto +Z before the AHRS runs
+# (avoids the Euler gimbal-lock singularity at pitch=±90°). Keep the device
+# roughly still for this window.
+GRAVITY_DETECT_S = 2.0
 
 # Method for getting body→world attitude / gravity reference:
 #   "madgwick" — classic AHRS quaternion with motion-gated accel correction.
@@ -56,7 +67,7 @@ HIGH_HZ = 5.
 #                attitude. Robust to lever-arm centripetal (accel never used
 #                for attitude estimation).
 METHOD = "madgwick"
-GRAVITY_CUTOFF_HZ = 0.25  # only used when METHOD == "lowpass"
+GRAVITY_CUTOFF_HZ = 0.05  # only used when METHOD == "lowpass"
 SAVGOL_ATTITUDE_WINDOW_S = 10.0  # only used when METHOD == "savgol"
 SAVGOL_ATTITUDE_POLYORDER = 3    # only used when METHOD == "savgol"
 
@@ -68,30 +79,43 @@ SAVGOL_WINDOW_S = 0.5
 SAVGOL_POLYORDER = 3
 
 
-def find_default_data_file() -> Path | None:
-    here = Path(__file__).parent
-    candidates = sorted(here.glob("DATA_BOOT_*.dat"))
-    return candidates[0] if candidates else None
-
-
 def main():
+    # Default to the BOOT_*/ folder with the highest boot number (same picker
+    # as plot_raw_accel.py); an explicit path argument overrides it and may be
+    # either a single .dat file or a BOOT_*/ folder.
     if len(sys.argv) > 1:
-        data_file = Path(sys.argv[1])
+        path = Path(sys.argv[1])
     else:
-        data_file = find_default_data_file()
-        if data_file is None:
-            print("No data file given and no DATA_BOOT_*.dat found.")
-            print("Usage: python ahrs_example.py [path/to/file.dat]")
+        path = find_default_path()
+        if path is None:
+            print("No data file or BOOT_*/ folder given and none found.")
+            print("Usage: python ahrs_example.py [path/to/file.dat OR path/to/BOOT_NNNNNN]")
             return
-        print(f"Auto-selected: {data_file.name}")
+        kind = "folder" if path.is_dir() else "file"
+        print(f"Auto-selected newest {kind}: {path.name}")
 
-    if not data_file.exists():
-        print(f"Not found: {data_file}")
+    if not path.exists():
+        print(f"Not found: {path}")
         return
 
-    # 1) Decode + load
-    result = decode_file(data_file, allow_no_pps=True)
-    data = load_data_as_arrays(result["file"])
+    # 1) Decode + load. load_data_from_path handles both a single .dat and a
+    #    whole BOOT_*/ folder (decoding every file and splicing them into one
+    #    contiguous timeseries).
+    data, source_files, _file_starts = load_data_from_path(path)
+    data_name = path.name if path.is_dir() else source_files[0].name
+
+    # 1a) Drop the DMP boot-warmup region so it doesn't corrupt the attitude
+    #     bootstrap and the integration. _file_starts is recomputed but unused
+    #     downstream here.
+    data, _file_starts, n_dropped = _clip_initial_seconds(data, _file_starts, SKIP_START_S)
+    if n_dropped > 0:
+        print(f"Skipped first {n_dropped} IMU samples ({SKIP_START_S:.1f} s) of warmup.")
+
+    # 1b) Gravity auto-align happens INSIDE the compute_* functions now
+    #     (auto_align_gravity=True by default) — it detects the dominant
+    #     gravity axis and rotates it onto body -Z so the AHRS works
+    #     regardless of mounting orientation, avoiding the Euler gimbal-lock
+    #     singularity. We just pass the detect window through.
 
     # 2) AHRS / gravity-tracking + frequency-domain double integration
     if METHOD == "lowpass":
@@ -100,6 +124,7 @@ def main():
             low_hz=LOW_HZ,
             high_hz=HIGH_HZ,
             gravity_cutoff_hz=GRAVITY_CUTOFF_HZ,
+            gravity_detect_seconds=GRAVITY_DETECT_S,
         )
     elif METHOD == "madgwick":
         vmot = compute_vertical_motion(
@@ -107,12 +132,14 @@ def main():
             low_hz=LOW_HZ,
             high_hz=HIGH_HZ,
             motion_gate_threshold=GRAVITY_CUTOFF_HZ,
+            gravity_detect_seconds=GRAVITY_DETECT_S,
         )
     elif METHOD == "savgol":
         vmot = compute_vertical_motion_savgol_detrend(
             data,
             low_hz=LOW_HZ,
             high_hz=HIGH_HZ,
+            gravity_detect_seconds=GRAVITY_DETECT_S,
             savgol_window_seconds=SAVGOL_ATTITUDE_WINDOW_S,
             savgol_polyorder=SAVGOL_ATTITUDE_POLYORDER,
         )
@@ -175,7 +202,7 @@ def main():
     ax.axhline(0, color="k", linewidth=0.5, alpha=0.3)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Vertical velocity, +up (mm/s)")
-    ax.set_title(f"Vertical velocity — {data_file.name}")
+    ax.set_title(f"Vertical velocity — {data_name}")
     ax.grid(True, alpha=0.3)
     print("  ok  vertical velocity plot")
 
@@ -189,7 +216,7 @@ def main():
     ax.axhline(-s, color="g", linewidth=0.5, linestyle="--", alpha=0.5)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Vertical displacement, +up (mm)")
-    ax.set_title(f"Vertical displacement (band-pass [{LOW_HZ}, {HIGH_HZ}] Hz) — {data_file.name}")
+    ax.set_title(f"Vertical displacement (band-pass [{LOW_HZ}, {HIGH_HZ}] Hz) — {data_name}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     print("  ok  vertical displacement plot (main result)")

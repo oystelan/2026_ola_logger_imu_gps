@@ -36,6 +36,20 @@ from scipy.spatial.transform import Rotation
 
 G_STD = 9.80665  # m/s², standard gravity
 
+# Absolute floor (m/s²) on the magnitude-outlier rejection limit. The
+# magnitude filter rejects samples whose |accel| deviates from the median by
+# more than magnitude_mad_threshold × MAD. On CLEAN recordings the MAD of
+# |accel| is tiny (~0.05 m/s²), so 8×MAD ≈ 0.4 m/s² — TIGHTER than real wave
+# motion. Crucially, when the device's gravity axis is also its motion axis
+# (a near-vertical float), vertical acceleration adds directly to gravity and
+# legitimately moves |accel| by the full motion amplitude (±0.5-2.5 m/s² in
+# practice). Without a floor the filter then deletes the wave signal itself
+# via hold-last-good, attenuating the AHRS vertical output ~2x (diagnosed on
+# BOOT_000000). Flooring the limit at ~0.5 g lets the filter still catch
+# genuine garbage (MISO/FIFO glitches deviate ≈1 g+ from gravity) while never
+# touching real wave motion.
+MAGNITUDE_OUTLIER_ABS_FLOOR_MS2 = 5.0
+
 
 # ------------------------------ Madgwick AHRS ------------------------------
 
@@ -142,6 +156,76 @@ def madgwick_step_imu(
     q_new /= np.linalg.norm(q_new)
     state.q = q_new
     return use_accel
+
+
+def align_gravity_to_body_z(
+    acc: np.ndarray,
+    gyr: np.ndarray,
+    detect_samples: int,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Rotate accel+gyro into a body frame whose -Z reads +1g at rest.
+
+    Auto-detects which body axis gravity is on from the mean accel over the
+    first `detect_samples`, then applies a proper (right-handed, det=+1)
+    axis-permutation so that:
+      * the AHRS always sees gravity on the same axis regardless of how the
+        device was physically mounted, and
+      * the convention matches initial_attitude_from_accel(), which treats
+        the device as level (roll=pitch=0) when the *accel* reads -1g on body
+        +Z (so gravity direction g_body = -accel points along +Z). We
+        therefore map the gravity-dominant axis onto -Z.
+
+    This removes the Euler gimbal-lock singularity you hit when the PCB is
+    mounted with a non-Z silkscreen axis pointing down (gravity on X or Y →
+    pitch = ±90°). Without it the bootstrap roll/pitch land near ±180° and the
+    Madgwick accel-correction is degraded.
+
+    Handles all six axis-aligned start orientations (±X, ±Y, ±Z). A start
+    tilted between axes picks whichever component is largest and rotates that
+    to vertical; the AHRS then converges out the residual tilt normally.
+
+    Args:
+        acc: (N,3) accel in m/s² (body frame, as column-stacked from data).
+        gyr: (N,3) gyro in rad/s (same frame).
+        detect_samples: number of leading samples to average for the gravity
+            direction. Keep the device roughly still over this window.
+
+    Returns:
+        (acc_rot, gyr_rot, description). If acc is empty, returns the inputs
+        unchanged with a "no samples" description.
+    """
+    if acc.shape[0] == 0:
+        return acc, gyr, "no samples"
+    n = max(1, min(acc.shape[0], detect_samples))
+    a_mean = acc[:n].mean(axis=0)
+    dom = int(np.argmax(np.abs(a_mean)))       # 0=X, 1=Y, 2=Z dominant
+    sign = 1.0 if a_mean[dom] >= 0 else -1.0    # +1 if that axis reads +g
+
+    # Build R so new_z = -sign*old[dom]  (gravity-positive axis -> -Z), with
+    # new_x/new_y completing a right-handed frame.
+    if dom == 2:
+        if sign < 0:
+            R = np.eye(3)
+            desc = "accel -g on +Z (identity, already level)"
+        else:
+            R = np.array([[1.0, 0, 0],
+                          [0, -1.0, 0],
+                          [0, 0, -1.0]])
+            desc = "accel +g on +Z -> rotated onto -Z"
+    elif dom == 0:
+        R = np.array([[0, 1.0, 0],
+                      [0, 0,   1.0],
+                      [-sign, 0, 0]])
+        desc = f"accel {'+' if sign > 0 else '-'}g on X -> rotated onto -Z"
+    else:  # dom == 1
+        R = np.array([[0, 0,   1.0],
+                      [1.0, 0, 0],
+                      [0, -sign, 0]])
+        desc = f"accel {'+' if sign > 0 else '-'}g on Y -> rotated onto -Z"
+
+    acc_rot = acc @ R.T
+    gyr_rot = gyr @ R.T
+    return acc_rot, gyr_rot, desc
 
 
 def initial_attitude_from_accel(accel_mean_body: np.ndarray) -> np.ndarray:
@@ -507,7 +591,11 @@ def _filter_imu_outliers(
         median_mag = float(np.median(mag_acc))
         mad = float(np.median(np.abs(mag_acc - median_mag)))
         if mad > 0:
-            limit = magnitude_mad_threshold * mad
+            # Floor the limit at an absolute physical bound so the filter
+            # never gets tighter than real wave motion on clean data. See
+            # MAGNITUDE_OUTLIER_ABS_FLOOR_MS2 for the rationale.
+            limit = max(magnitude_mad_threshold * mad,
+                        MAGNITUDE_OUTLIER_ABS_FLOOR_MS2)
             mask = np.abs(mag_acc - median_mag) > limit
             if mask.any():
                 acc_c = acc.copy()
@@ -523,10 +611,13 @@ def _filter_imu_outliers(
                         last_a, last_g = acc[i], gyr[i]
                 acc, gyr = acc_c, gyr_c
                 worst_idx = int(np.argmax(np.abs(mag_acc - median_mag)))
+                limit_src = ("MAD" if magnitude_mad_threshold * mad
+                             >= MAGNITUDE_OUTLIER_ABS_FLOOR_MS2 else "abs-floor")
                 logger.info(
                     f"Magnitude outlier filter: held {n_mag_held} samples "
-                    f"(threshold {magnitude_mad_threshold}×MAD = "
-                    f"{limit*1000:.0f} mm/s²; median |a| = "
+                    f"(limit {limit*1000:.0f} mm/s² [{limit_src}]; "
+                    f"{magnitude_mad_threshold}×MAD={magnitude_mad_threshold*mad*1000:.0f}, "
+                    f"floor={MAGNITUDE_OUTLIER_ABS_FLOOR_MS2*1000:.0f}; median |a| = "
                     f"{median_mag:.2f} m/s², worst sample {worst_idx} "
                     f"@ t={t_raw[worst_idx]:.1f}s with |a|={mag_acc[worst_idx]:.2f} m/s²)"
                 )
@@ -611,6 +702,8 @@ def compute_vertical_motion(
     detrend_polynomial_order: int = 3,
     fft_taper_fraction: float = 0.1,
     cutoff_softness: float = 0.3,
+    auto_align_gravity: bool = True,
+    gravity_detect_seconds: float = 2.0,
 ) -> VerticalAHRSResult:
     """Estimate band-pass vertical motion from a `load_data_as_arrays` dict.
 
@@ -752,6 +845,15 @@ def compute_vertical_motion(
         data["imu_gyr_y"] * mdps_to_radps,
         data["imu_gyr_z"] * mdps_to_radps,
     ])
+
+    # --- Auto-align gravity onto body -Z so this works regardless of the
+    #     device's physical mounting orientation (avoids the Euler gimbal-lock
+    #     singularity at pitch=±90° when gravity is on body X or Y).
+    if auto_align_gravity:
+        dt_med0 = float(np.median(np.diff(t_raw))) if n_raw > 1 else 0.01
+        n_detect = max(1, int(gravity_detect_seconds / max(dt_med0, 1e-6)))
+        acc, gyr, grav_desc = align_gravity_to_body_z(acc, gyr, n_detect)
+        logger.info(f"Gravity auto-align: {grav_desc}")
 
     # --- Outlier filtering (3-stage hold-last-good)
     acc, gyr = _filter_imu_outliers(
@@ -937,6 +1039,8 @@ def compute_vertical_motion_lowpass_gravity(
     detrend_polynomial_order: int = 3,
     fft_taper_fraction: float = 0.1,
     cutoff_softness: float = 0.3,
+    auto_align_gravity: bool = True,
+    gravity_detect_seconds: float = 2.0,
 ) -> VerticalAHRSResult:
     """Complementary-filter AHRS: gyro tracks fast attitude, low-pass accel anchors slow gravity.
 
@@ -1011,6 +1115,13 @@ def compute_vertical_motion_lowpass_gravity(
         data["imu_gyr_y"] * mdps_to_radps,
         data["imu_gyr_z"] * mdps_to_radps,
     ])
+
+    # --- Auto-align gravity onto body -Z (mounting-orientation independence)
+    if auto_align_gravity:
+        dt_med0 = float(np.median(np.diff(t_raw))) if n_raw > 1 else 0.01
+        n_detect = max(1, int(gravity_detect_seconds / max(dt_med0, 1e-6)))
+        acc, gyr, grav_desc = align_gravity_to_body_z(acc, gyr, n_detect)
+        logger.info(f"Gravity auto-align: {grav_desc}")
 
     acc, gyr = _filter_imu_outliers(
         t_raw, acc, gyr, data,
@@ -1176,6 +1287,8 @@ def compute_vertical_motion_savgol_detrend(
     detrend_polynomial_order: int = 3,
     fft_taper_fraction: float = 0.1,
     cutoff_softness: float = 0.3,
+    auto_align_gravity: bool = True,
+    gravity_detect_seconds: float = 2.0,
 ) -> VerticalAHRSResult:
     """Gyro AHRS with Savitzky-Golay detrending on attitude.
 
@@ -1243,6 +1356,13 @@ def compute_vertical_motion_savgol_detrend(
         data["imu_gyr_y"] * mdps_to_radps,
         data["imu_gyr_z"] * mdps_to_radps,
     ])
+
+    # --- Auto-align gravity onto body -Z (mounting-orientation independence)
+    if auto_align_gravity:
+        dt_med0 = float(np.median(np.diff(t_raw))) if n_raw > 1 else 0.01
+        n_detect = max(1, int(gravity_detect_seconds / max(dt_med0, 1e-6)))
+        acc, gyr, grav_desc = align_gravity_to_body_z(acc, gyr, n_detect)
+        logger.info(f"Gravity auto-align: {grav_desc}")
 
     acc, gyr = _filter_imu_outliers(
         t_raw, acc, gyr, data,
@@ -1376,6 +1496,133 @@ def compute_vertical_motion_savgol_detrend(
         displacement_z_up=disp_z,
         roll_deg=np.rad2deg(roll_clean),
         pitch_deg=np.rad2deg(pitch_clean),
+        fs_hz=fs,
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
+
+
+def compute_vertical_motion_fixed_attitude(
+    data: dict,
+    low_hz: float = 0.05,
+    high_hz: float = 2.5,
+    stationary_init_seconds: float = 2.0,
+    resample_hz: float | None = None,
+    use_outlier_flags: bool = True,
+    magnitude_mad_threshold: float = 8.0,
+    hampel_window_seconds: float = 0.25,
+    hampel_k_mad: float = 5.0,
+    detrend_polynomial_order: int = 3,
+    fft_taper_fraction: float = 0.1,
+    cutoff_softness: float = 0.3,
+    auto_align_gravity: bool = True,
+    gravity_detect_seconds: float = 2.0,
+) -> VerticalAHRSResult:
+    """Vertical motion with a FIXED attitude — no per-sample attitude tracking.
+
+    For a near-level device (a wave float that only rocks a few degrees), the
+    Madgwick / complementary / savgol attitude trackers all attenuate the
+    vertical signal: they interpret the wave-band vertical acceleration as a
+    wave-synchronous tilt and rotate the frame to "explain" it, cancelling a
+    large fraction of the real motion (verified on BOOT_000000: tracked output
+    was ~0.2 m/s² vs a true ~0.46 m/s²).
+
+    This function instead computes the body→world rotation ONCE from the mean
+    accel over the stationary-init window, holds it constant, rotates every
+    sample's accel through it, removes gravity, and takes the +up component.
+    Most accurate when the mean orientation is stable and tilt amplitude is
+    small (< ~15°). NOT appropriate if the device genuinely reorients during
+    the recording (capsize, handheld flip) — use the gyro-tracking methods for
+    that.
+
+    Same gravity auto-align, outlier filtering, detrend, and FFT band-pass
+    integration as the other methods; only the attitude handling differs.
+    """
+    imu_us = np.asarray(data["imu_micros_unwrapped"], dtype=np.float64)
+    n_raw = len(imu_us)
+    if n_raw < 100:
+        raise ValueError(f"Not enough IMU samples ({n_raw})")
+    t_raw = (imu_us - imu_us[0]) * 1e-6
+
+    mg_to_ms2 = G_STD / 1000.0
+    mdps_to_radps = (np.pi / 180.0) / 1000.0
+    acc = np.column_stack([
+        data["imu_acc_x"] * mg_to_ms2,
+        data["imu_acc_y"] * mg_to_ms2,
+        data["imu_acc_z"] * mg_to_ms2,
+    ])
+    gyr = np.column_stack([
+        data["imu_gyr_x"] * mdps_to_radps,
+        data["imu_gyr_y"] * mdps_to_radps,
+        data["imu_gyr_z"] * mdps_to_radps,
+    ])
+
+    if auto_align_gravity:
+        dt_med0 = float(np.median(np.diff(t_raw))) if n_raw > 1 else 0.01
+        n_detect = max(1, int(gravity_detect_seconds / max(dt_med0, 1e-6)))
+        acc, gyr, grav_desc = align_gravity_to_body_z(acc, gyr, n_detect)
+        logger.info(f"Gravity auto-align: {grav_desc}")
+
+    acc, gyr = _filter_imu_outliers(
+        t_raw, acc, gyr, data,
+        use_outlier_flags=use_outlier_flags,
+        magnitude_mad_threshold=magnitude_mad_threshold,
+        hampel_window_seconds=hampel_window_seconds,
+        hampel_k_mad=hampel_k_mad,
+    )
+
+    # --- Single fixed attitude from the stationary-init window
+    dt_med = float(np.median(np.diff(t_raw)))
+    n_init = max(1, min(n_raw, int(stationary_init_seconds / max(dt_med, 1e-6))))
+    a_mean = acc[:n_init].mean(axis=0)
+    q0 = initial_attitude_from_accel(a_mean)
+    R0 = Rotation.from_quat([q0[1], q0[2], q0[3], q0[0]])
+    logger.info(
+        f"Fixed attitude from first {n_init} samples (~{n_init * dt_med:.1f}s): "
+        f"a_mean={a_mean.round(3)}, q0={q0.round(3)}"
+    )
+
+    # --- Rotate all accel by the same fixed rotation, subtract gravity, +up
+    acc_world = R0.apply(acc)
+    acc_world_linear = acc_world + np.array([0.0, 0.0, G_STD])
+    acc_z_up_raw = -acc_world_linear[:, 2]
+
+    # Constant attitude → roll/pitch are constant; report them for the record.
+    eul0 = R0.as_euler("ZYX")
+    roll0 = np.rad2deg(eul0[2])
+    pitch0 = np.rad2deg(eul0[1])
+
+    # --- Resample onto uniform grid for FFT
+    fs = (1.0 / dt_med) if resample_hz is None else float(resample_hz)
+    n_uniform = int(np.floor((t_raw[-1] - t_raw[0]) * fs)) + 1
+    t_uniform = t_raw[0] + np.arange(n_uniform) / fs
+    acc_z_up = np.interp(t_uniform, t_raw, acc_z_up_raw)
+
+    if detrend_polynomial_order >= 0:
+        acc_z_detrended = polynomial_detrend(acc_z_up, detrend_polynomial_order)
+    else:
+        acc_z_detrended = acc_z_up
+    acc_z_bp = lowpass_zero_phase(acc_z_detrended, fs, high_hz, order=4)
+    vel_z, disp_z = fft_double_integrate_bandpass(
+        acc_z_detrended, fs, low_hz, high_hz,
+        taper_fraction=fft_taper_fraction,
+        cutoff_softness=cutoff_softness,
+    )
+
+    logger.success(
+        f"Fixed-attitude vertical complete: {n_raw} IMU → {n_uniform} uniform "
+        f"@ {fs:.1f} Hz; fixed roll/pitch = {roll0:.1f}/{pitch0:.1f} deg; "
+        f"band [{low_hz}, {high_hz}] Hz; σ_disp = {np.std(disp_z) * 1000:.1f} mm"
+    )
+
+    return VerticalAHRSResult(
+        t=t_uniform - t_uniform[0],
+        accel_z_up=acc_z_bp,
+        accel_z_up_raw=acc_z_up,
+        velocity_z_up=vel_z,
+        displacement_z_up=disp_z,
+        roll_deg=np.full(n_uniform, roll0),
+        pitch_deg=np.full(n_uniform, pitch0),
         fs_hz=fs,
         low_hz=low_hz,
         high_hz=high_hz,
