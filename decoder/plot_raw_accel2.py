@@ -14,13 +14,83 @@ If no path is given, picks the most recently modified DATA_BOOT_*.dat in
 the script directory.
 """
 
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 
 from decoder import decode_file, load_data_as_arrays
+
+
+# Drop this many seconds of IMU data from the start of the recording before
+# plotting. The DMP firmware emits warmup garbage for ~1-2 s after boot which
+# blows out the autoscaled y-axis on every panel. Set to 0 to disable.
+SKIP_START_S = 1.5
+
+# True = plot the x-axis as wall-clock UTC (datetime ticks). False = plot it
+# as "elapsed seconds since first sample" (numeric). UTC needs the recording
+# to have either PPS-regressed imu_utc, GNSS posix fixes, or a parseable
+# filename timestamp; falls back to elapsed seconds and prints a notice if
+# none of those are available.
+USE_UTC = True
+
+
+def _filename_timestamp_to_posix(name: str) -> float | None:
+    """Pull POSIX seconds from a DATA_BOOT_NNNNNN_TIME_YYYYMMDDTHHMMSS.dat
+    filename. UTC-interpreted. Returns None if the pattern doesn't match.
+    """
+    m = re.search(r"_TIME_(\d{8})T(\d{6})", name)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _build_time_axis(data: dict, source_filename: str | None) -> tuple[np.ndarray, str, bool]:
+    """Return (t, x_label, used_utc). Three-tier UTC fallback (mirrors
+    plot_raw_accel.py): PPS-regressed imu_utc -> linear fit on GNSS posix ->
+    filename anchor. Falls back to elapsed seconds if none of those work or
+    if USE_UTC is False.
+    """
+    imu_micros = np.asarray(data["imu_micros_unwrapped"], dtype=np.float64)
+    if USE_UTC and imu_micros.size > 0:
+        # Path 1: PPS-regressed imu_utc
+        utc_raw = np.asarray(data.get("imu_utc", []), dtype=np.float64)
+        if utc_raw.size and np.any(np.isfinite(utc_raw)):
+            return (utc_raw * 1e9).astype("datetime64[ns]"), "UTC", True
+
+        # Path 2: linear fit gnss_micros_unwrapped -> gnss_posix
+        g_micros = np.asarray(data.get("gnss_micros_unwrapped", []), dtype=np.float64)
+        g_posix = np.asarray(data.get("gnss_posix", []), dtype=np.float64)
+        if g_micros.size >= 2 and g_posix.size == g_micros.size:
+            valid = g_posix > 1e9   # plausible POSIX after year 2001
+            if valid.sum() >= 2:
+                slope, intercept = np.polyfit(g_micros[valid], g_posix[valid], 1)
+                est = slope * imu_micros + intercept
+                return (est * 1e9).astype("datetime64[ns]"), "UTC (from GNSS posix fit)", True
+
+        # Path 3: filename timestamp + elapsed micros
+        anchor = _filename_timestamp_to_posix(source_filename or "")
+        if anchor is not None:
+            elapsed = (imu_micros - imu_micros[0]) * 1e-6
+            return (
+                (np.int64(anchor * 1e9) + (elapsed * 1e9).astype(np.int64))
+                    .astype("datetime64[ns]"),
+                "UTC (from filename anchor)",
+                True,
+            )
+
+        print("USE_UTC=True but no usable UTC source found; falling back to elapsed seconds.")
+
+    t = (imu_micros - imu_micros[0]) * 1e-6
+    return t, "Time since first sample (s)", False
 
 
 def find_default_data_file() -> Path | None:
@@ -55,23 +125,51 @@ def main():
         print("No IMU samples in this file.")
         return
 
-    # Use raw micros (no PPS / UTC required); seconds since first sample
-    t_us = np.asarray(data["imu_micros_unwrapped"], dtype=np.float64)
-    t = (t_us - t_us[0]) * 1e-6
+    # Drop the DMP warmup region (see SKIP_START_S at the top of this file).
+    if SKIP_START_S > 0:
+        imu_us_full = np.asarray(data["imu_micros_unwrapped"], dtype=np.float64)
+        elapsed_full = (imu_us_full - imu_us_full[0]) * 1e-6
+        n_drop = int(np.searchsorted(elapsed_full, SKIP_START_S, side="left"))
+        # Don't strip the entire recording — leave at least one sample.
+        n_drop = max(0, min(n_drop, len(imu_us_full) - 1))
+        if n_drop > 0:
+            n_imu = len(imu_us_full)
+            for k in list(data.keys()):
+                v = data[k]
+                if not k.startswith("imu_"):
+                    continue
+                if not isinstance(v, np.ndarray) or v.size != n_imu:
+                    continue
+                data[k] = v[n_drop:]
+            print(f"Dropped first {n_drop} IMU samples ({SKIP_START_S:.1f} s) "
+                  f"of warmup / startup transient.")
 
-    # Highlight any gaps > 2× the median sample interval
-    dts = np.diff(t)
+    # Build the x-axis (UTC datetimes if USE_UTC and a UTC source is
+    # available, else elapsed seconds — see _build_time_axis).
+    t, t_label, used_utc = _build_time_axis(data, source_filename=data_file.name)
+
+    # Highlight any gaps > 2× the median sample interval. Whether t is
+    # elapsed-seconds or datetime64, np.diff gives the right type.
+    if used_utc:
+        dts = np.diff(t).astype("timedelta64[ns]").astype(np.float64) * 1e-9
+    else:
+        dts = np.diff(t)
     dt_med = float(np.median(dts))
     gap_threshold = max(2 * dt_med, 0.020)  # 20 ms floor
     gap_idx = np.where(dts > gap_threshold)[0]
 
+    duration = (t[-1] - t[0])
+    duration_s = (duration.astype("timedelta64[s]").astype(np.float64)
+                  if used_utc else float(duration))
     print(f"\nSamples:           {len(t)}")
-    print(f"Duration:          {t[-1]:.1f} s")
+    print(f"Duration:          {duration_s:.1f} s")
     print(f"Median dt:         {dt_med*1000:.3f} ms (~{1/dt_med:.1f} Hz)")
     print(f"Max dt:            {dts.max()*1000:.1f} ms")
     print(f"Gaps > {gap_threshold*1000:.0f} ms:    {len(gap_idx)}")
     if len(gap_idx) > 0:
-        print(f"  Worst gap: {dts[gap_idx].max()*1000:.1f} ms at t={t[gap_idx[np.argmax(dts[gap_idx])]]:.1f} s")
+        worst = t[gap_idx[np.argmax(dts[gap_idx])]]
+        worst_str = str(worst) if used_utc else f"{float(worst):.1f} s"
+        print(f"  Worst gap: {dts[gap_idx].max()*1000:.1f} ms at t={worst_str}")
 
     labels = ("X", "Y", "Z")
     colors = ("tab:blue", "tab:green", "tab:red")
@@ -168,7 +266,9 @@ def main():
         axes[2].set_ylabel("Mag (uT)")
         axes[2].grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("Time since first sample (s)")
+    axes[-1].set_xlabel(t_label)
+    if used_utc:
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=None))
     fig.tight_layout()
 
     plt.show()

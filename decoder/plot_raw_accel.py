@@ -45,6 +45,17 @@ from decoder import decode_file, load_data_as_arrays
 # (and any slow thermal wander on top) while keeping real rotation motion.
 HIGHPASS_HZ = 0.1
 
+# Drop this many seconds of IMU data from the start of the recording before
+# plotting. The DMP firmware emits warmup garbage for ~1-2 s after boot which
+# blows out the autoscaled y-axis on every panel. Set to 0 to disable.
+SKIP_START_S = 1.5
+
+# True = plot the x-axis as wall-clock UTC (datetime ticks). False = plot it
+# as "elapsed seconds since first sample" (numeric). UTC needs the recording
+# to have either PPS-regressed imu_utc, GNSS posix fixes, or a parseable
+# filename timestamp — see _build_time_axis below.
+USE_UTC = True
+
 # uint32 micros() period — used to splice files when MCU micros wraps
 # between consecutive files in the same boot folder.
 MICROS_WRAP = 1 << 32
@@ -147,6 +158,49 @@ def load_data_from_path(path: Path) -> tuple[dict, list[Path], np.ndarray]:
     return combined, files, np.asarray(file_starts, dtype=np.int64)
 
 
+def _clip_initial_seconds(
+    data: dict, file_starts: np.ndarray, skip_s: float,
+) -> tuple[dict, np.ndarray, int]:
+    """Drop the first `skip_s` seconds of IMU data so the DMP warmup garbage
+    at the start of every recording doesn't push the autoscaled y-axis out.
+
+    Slices every `imu_*` array in `data` consistently from the same start
+    index. GNSS/PPS arrays and scalar header fields are passed through
+    untouched (their timestamps are absolute, not file-relative). The
+    file-boundary indices are shifted to track the new IMU base index;
+    boundaries that fell inside the clipped region are clamped to 0.
+
+    Returns: (new_data, new_file_starts, n_dropped).
+    """
+    if skip_s <= 0:
+        return data, file_starts, 0
+    imu_us = np.asarray(data["imu_micros_unwrapped"], dtype=np.float64)
+    if imu_us.size == 0:
+        return data, file_starts, 0
+    elapsed_s = (imu_us - imu_us[0]) * 1e-6
+    # First sample whose elapsed time exceeds the skip window.
+    n_drop = int(np.searchsorted(elapsed_s, skip_s, side="left"))
+    if n_drop <= 0:
+        return data, file_starts, 0
+    if n_drop >= len(imu_us):
+        # Recording is shorter than the skip window — keep at least
+        # one sample so downstream code doesn't trip on empty arrays.
+        n_drop = max(0, len(imu_us) - 1)
+        if n_drop == 0:
+            return data, file_starts, 0
+
+    n_imu = len(imu_us)
+    new_data = dict(data)
+    for k, v in data.items():
+        if not k.startswith("imu_"):
+            continue
+        if not isinstance(v, np.ndarray) or v.size != n_imu:
+            continue
+        new_data[k] = v[n_drop:]
+    new_file_starts = np.maximum(file_starts - n_drop, 0).astype(np.int64)
+    return new_data, new_file_starts, n_drop
+
+
 def _build_time_axis(data: dict, use_utc: bool) -> tuple[np.ndarray, str, bool]:
     """Return (t, x_label, used_utc).
 
@@ -247,8 +301,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", type=Path, default=None,
                     help="Single .dat file OR a BOOT_*/ folder of .dat files")
-    ap.add_argument("--utc", action="store_true",
-                    help="Use UTC time on the x-axis (requires GNSS fix during recording)")
     args = ap.parse_args()
 
     path = args.path
@@ -273,12 +325,19 @@ def main():
         print("No IMU samples in this recording.")
         return
 
+    # Trim the DMP warmup region off the front of the IMU data (see
+    # SKIP_START_S at the top of this file).
+    data, file_starts, n_dropped = _clip_initial_seconds(data, file_starts, SKIP_START_S)
+    if n_dropped > 0:
+        print(f"Dropped first {n_dropped} IMU samples ({SKIP_START_S:.1f} s) "
+              f"of warmup / startup transient.")
+
     title_name = path.name if path.is_dir() else source_files[0].name
     if len(source_files) > 1:
         title_name = f"{path.name} ({len(source_files)} files)"
 
     # Time axis
-    t, t_label, used_utc = _build_time_axis(data, use_utc=args.utc)#args.utc
+    t, t_label, used_utc = _build_time_axis(data, use_utc=USE_UTC)
 
     # Gap detection (works for both seconds and datetime64 x-arrays)
     gap_threshold, gap_idx, dt_med, dt_sec = _gap_threshold_idx(t, used_utc)

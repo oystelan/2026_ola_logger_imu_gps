@@ -35,7 +35,7 @@ from decoder import decode_file, load_data_as_arrays
 
 
 # Frequency band of motion-of-interest. Tune to your basin / wave setup.
-LOW_HZ = 0.07
+LOW_HZ = 0.2
 HIGH_HZ = 5.
 
 # Method for getting body→world attitude / gravity reference:
