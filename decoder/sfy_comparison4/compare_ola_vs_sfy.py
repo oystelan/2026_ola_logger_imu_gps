@@ -58,7 +58,7 @@ SFY_NETCDF  = HERE / "test5_fixed.nc"
 # AHRS band-pass edges. Both buoys are looking at the same waves so we want
 # the same passband for both.
 LOW_HZ  = 0.05
-HIGH_HZ = 2.5
+HIGH_HZ = 5.
 
 # Which OLA vertical-motion estimator to run:
 #   "fixed"    — fixed bootstrap attitude, no per-sample tracking. Best for a
@@ -76,15 +76,22 @@ METHOD = "mahony"
 # toward gravity = better rotation rejection, but too high attenuates real
 # heave (the filter explains heave accel away as tilt). kp~5 is the sweet
 # spot found against the group-3 rotation recording. ki learns gyro bias.
-MAHONY_KP = 5.0
+MAHONY_KP = 8.0
 MAHONY_KI = 1.25
+
+# Save the time-corrected vertical-acceleration timeseries (the middle panel:
+# OLA accel_z_up gravity-removed + SFY w_z-mean) to an .npz so a downstream
+# script can integrate accel -> velocity -> displacement. Each buoy is saved on
+# its OWN corrected-UTC grid (OLA: #4 timebase fix + OLA_TIME_SHIFT_S; SFY:
+# rate/offset rebuild). Times are int64 ns since the Unix epoch (UTC).
+SAVE_TIMESERIES = True
 
 # Manual time shift applied to the OLA timestamps before plotting (seconds;
 # positive = shift OLA later in time). Set to 0.0 to trust the absolute UTC
 # of both recordings (the expectation now that both are GNSS-time-stamped).
 # Use ENABLE_XCORR_DIAG below to PRINT the cross-correlation lag for sanity
 # without applying it.
-OLA_TIME_SHIFT_S = -1.7
+OLA_TIME_SHIFT_S = -1.1
 
 # === SFY time-axis rebuild ===========================================
 # We established that OLA is the GPS-true clock (its IMU micros are mapped
@@ -108,7 +115,7 @@ SFY_RATE_SCALE = 1.
                                    # was ~-1%, more than 55.84/56.11 predicted, so
                                    # the numerator was lowered 55.84 -> 55.54.)
 #SFY_TIME_OFFSET_S = 6.420          # constant offset after rate correction (s)
-SFY_TIME_OFFSET_S = 0.
+SFY_TIME_OFFSET_S = 0.6
 
 # When True, still compute and print the cross-correlation lag between the
 # OLA raw acc_x and SFY w_z as a diagnostic — but it is NOT applied unless
@@ -371,6 +378,34 @@ def main() -> None:
         shift_td = np.timedelta64(int(round(OLA_TIME_SHIFT_S * 1e9)), "ns")
         ola_t       = ola_t       + shift_td
         raw_acc_x_t = raw_acc_x_t + shift_td
+
+    # === Save the time-corrected vertical-accel timeseries (middle panel) ===
+    # OLA accel_z_up (gravity removed, +up) and SFY (w_z - window mean), each on
+    # its own corrected-UTC grid. For the downstream integration script. Times
+    # are int64 nanoseconds since the Unix epoch (UTC); recover seconds with
+    # (t_ns - t_ns[0]) / 1e9. accel_up is m/s², +up, gravity already removed.
+    if SAVE_TIMESERIES:
+        ola_t_ns = ola_t.astype("datetime64[ns]").astype(np.int64)
+        sfy_t_ns = sfy_t.astype("datetime64[ns]").astype(np.int64)
+        out_path = HERE / f"vertical_timeseries_{OLA_FOLDER.name}.npz"
+        np.savez(
+            out_path,
+            ola_time_ns=ola_t_ns,
+            ola_accel_up=ola_az_raw.astype(np.float64),          # gravity removed, NOT band-passed
+            ola_accel_up_bandpassed=ola_az.astype(np.float64),   # AHRS band-passed [LOW_HZ, HIGH_HZ]
+            sfy_time_ns=sfy_t_ns,
+            sfy_accel_up=sfy_wz_ac.astype(np.float64),           # w_z - window mean
+            meta=np.array(
+                f"method={METHOD}; band=[{LOW_HZ},{HIGH_HZ}]Hz; "
+                f"ola_time_shift_s={OLA_TIME_SHIFT_S}; sfy_rate_scale={SFY_RATE_SCALE}; "
+                f"sfy_time_offset_s={SFY_TIME_OFFSET_S}; "
+                f"window={WINDOW_START}..{WINDOW_END}"),
+        )
+        ola_hz = 1.0 / np.median(np.diff(ola_t_ns) / 1e9)
+        sfy_hz = 1.0 / np.median(np.diff(sfy_t_ns) / 1e9)
+        print(f"\nSaved vertical timeseries -> {out_path}")
+        print(f"  OLA: {ola_t_ns.size} samples @ ~{ola_hz:.2f} Hz (accel_up + accel_up_bandpassed)")
+        print(f"  SFY: {sfy_t_ns.size} samples @ ~{sfy_hz:.2f} Hz (accel_up)")
 
     # === Plot ===
     fig, axes = plt.subplots(3, 1, figsize=(13, 9.5), sharex=True)

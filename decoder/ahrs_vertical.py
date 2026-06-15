@@ -1638,7 +1638,9 @@ def mahony_step_imu(
     kp: float = 1.0,
     ki: float = 0.2,
     motion_gate_threshold: float = 0.5,
-) -> tuple[bool, np.ndarray]:
+    accel_reject_band: float | None = None,
+    accel_w_min: float = 0.0,
+) -> tuple[float, np.ndarray]:
     """Single Mahony (explicit complementary) step using accel + gyro.
 
     The key difference from `madgwick_step_imu`: the integral term `e_int`
@@ -1661,27 +1663,48 @@ def mahony_step_imu(
             gravity each step. ~1.0 typical.
         ki: integral gain — rate at which gyro bias is learned. ~0.1-0.3.
             Set 0 to disable bias estimation (pure proportional Mahony).
-        motion_gate_threshold: as in madgwick_step_imu — when |accel| is far
-            from g, the *accel correction and bias integration are skipped*,
-            but the already-learned bias (e_int) is STILL applied to the gyro.
+        motion_gate_threshold: HARD gate (used only when accel_reject_band is
+            None). When |accel| is farther from g than this, the accel
+            correction and bias integration are skipped for the step (the
+            already-learned bias is still applied). A hard gate can cause
+            open-loop gyro drift under sustained motion — prefer the soft band.
+
+        accel_reject_band: SOFT acceleration rejection (m/s²). When set, the
+            accel correction weight ramps linearly from 1 (at |accel| = g) down
+            to `accel_w_min` as ||accel| - g| reaches this band, instead of a
+            hard on/off gate. This down-weights — but does not fully kill — the
+            accelerometer during linear acceleration (heave / lever-arm), so the
+            attitude rides the gyro through vigorous motion (less linear-accel
+            contamination of the tilt estimate, hence less gravity leaking into
+            the vertical channel) while still being corrected, and the bias
+            integral keeps learning, between/within motion. ~3 m/s² is a sensible
+            band for wave motion. None → use the hard motion_gate_threshold.
+
+        accel_w_min: floor for the soft-rejection weight (0..1). Keep > 0 (e.g.
+            0.05) so the accelerometer never fully disconnects during sustained
+            motion (which would let the gyro drift open-loop).
 
     Returns:
-        (used_accel, e_int) — whether the accel correction was applied, and the
-        updated integral term.
+        (w, e_int) — the accel-correction weight actually applied this step
+        (1 = full trust, 0 = none), and the updated integral term.
     """
     q0, q1, q2, q3 = state.q
 
     a_norm = np.linalg.norm(accel_body)
+    G = 9.80665
     if a_norm < 1e-6:
-        use_accel = False
-    elif abs(a_norm - 9.80665) > motion_gate_threshold:
-        use_accel = False
+        w = 0.0
+    elif accel_reject_band is not None:
+        # Soft rejection: weight ramps 1 -> accel_w_min over the band.
+        dev = abs(a_norm - G)
+        w = max(accel_w_min, 1.0 - dev / accel_reject_band)
     else:
-        use_accel = True
+        # Legacy hard gate.
+        w = 1.0 if abs(a_norm - G) <= motion_gate_threshold else 0.0
 
     gx, gy, gz = gyro_body  # rad/s
 
-    if use_accel:
+    if w > 0.0:
         # Measured gravity-down direction (body): accel opposes gravity.
         ax, ay, az = accel_body / a_norm
         mx, my, mz = -ax, -ay, -az
@@ -1694,14 +1717,15 @@ def mahony_step_imu(
         ey = mz * vx - mx * vz
         ez = mx * vy - my * vx
         e = np.array([ex, ey, ez])
-        # Integral (bias) feedback — only accumulate when we trust the accel.
+        # Integral (bias) feedback — weighted, so the bias learns less from a
+        # contaminated (high-|accel|) sample.
         if ki > 0.0:
-            e_int = e_int + e * dt
+            e_int = e_int + w * e * dt
     else:
         e = np.zeros(3)
 
-    # Corrected angular rate: gyro + proportional pull + learned bias.
-    omega = np.array([gx, gy, gz]) + kp * e + ki * e_int
+    # Corrected angular rate: gyro + (weighted) proportional pull + learned bias.
+    omega = np.array([gx, gy, gz]) + kp * w * e + ki * e_int
     wx, wy, wz = omega
 
     qDot = 0.5 * np.array([
@@ -1714,7 +1738,7 @@ def mahony_step_imu(
     q_new = state.q + qDot * dt
     q_new /= np.linalg.norm(q_new)
     state.q = q_new
-    return use_accel, e_int
+    return w, e_int
 
 
 def compute_vertical_motion_mahony(
@@ -1731,6 +1755,8 @@ def compute_vertical_motion_mahony(
     hampel_window_seconds: float = 0.25,
     hampel_k_mad: float = 5.0,
     motion_gate_threshold: float = 0.5,
+    accel_reject_band: float | None = None,
+    accel_w_min: float = 0.05,
     detrend_polynomial_order: int = 3,
     fft_taper_fraction: float = 0.1,
     cutoff_softness: float = 0.3,
@@ -1813,16 +1839,18 @@ def compute_vertical_motion_mahony(
             n_sub = int(np.ceil(dt / 0.05))
             sub_dt = dt / n_sub
             for _ in range(n_sub):
-                used, e_int = mahony_step_imu(
+                w_used, e_int = mahony_step_imu(
                     state, e_int, acc[i], gyr[i], sub_dt,
                     kp=kp, ki=ki, motion_gate_threshold=motion_gate_threshold,
+                    accel_reject_band=accel_reject_band, accel_w_min=accel_w_min,
                 )
         else:
-            used, e_int = mahony_step_imu(
+            w_used, e_int = mahony_step_imu(
                 state, e_int, acc[i], gyr[i], dt,
                 kp=kp, ki=ki, motion_gate_threshold=motion_gate_threshold,
+                accel_reject_band=accel_reject_band, accel_w_min=accel_w_min,
             )
-        if not used:
+        if w_used < 0.5:
             n_motion_gated += 1
         quat_log[i] = state.q
 
