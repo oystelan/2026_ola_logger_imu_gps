@@ -14,6 +14,72 @@ void turn_gnss_off(void){
     digitalWrite(PIN_QWIIC_PWR, LOW);
 }
 
+void print_gnss_status(SFE_UBLOX_GNSS &g){
+  wdt.restart();
+
+  // getFixType() returns the latest PVT (auto or polled); the other PVT-derived
+  // getters below reuse that same epoch, so this is a coherent snapshot.
+  uint8_t fix = g.getFixType();
+  SERIAL_USB->print(F("[gnss] fixType="));
+  SERIAL_USB->print(fix);
+  SERIAL_USB->print(F(" (0=none 2=2D 3=3D 5=time-only)  fixOK="));
+  SERIAL_USB->print(g.getGnssFixOk());
+  SERIAL_USB->print(F("  SIV="));
+  SERIAL_USB->print(g.getSIV());
+  SERIAL_USB->print(F("  PDOP="));
+  SERIAL_USB->print(g.getPDOP() / 100.0, 2);
+  SERIAL_USB->print(F("  | timeValid="));
+  SERIAL_USB->print(g.getTimeValid());
+  SERIAL_USB->print(F(" fullyResolved="));
+  SERIAL_USB->print(g.getTimeFullyResolved());
+  SERIAL_USB->print(F(" confirmedTime="));
+  SERIAL_USB->println(g.getConfirmedTime());
+  SERIAL_USB->flush();
+
+  wdt.restart();
+
+  // Per-satellite carrier-to-noise (UBX-NAV-SAT). With a GPS repeater this is
+  // the key diagnostic: it shows whether any usable signal is reaching the
+  // antenna. Typical thresholds: C/N0 < ~20 dB-Hz = too weak to use; a fix
+  // generally needs >=4 sats at >~25-30 dB-Hz.
+  if (g.getNAVSAT()){
+    uint8_t n = g.packetUBXNAVSAT->data.header.numSvs;
+    uint8_t with_signal = 0, used = 0, max_cno = 0;
+    for (uint8_t i = 0; i < n; i++){
+      uint8_t cno = g.packetUBXNAVSAT->data.blocks[i].cno;
+      if (cno > 0) with_signal++;
+      if (cno > max_cno) max_cno = cno;
+      if (g.packetUBXNAVSAT->data.blocks[i].flags.bits.svUsed) used++;
+    }
+    SERIAL_USB->print(F("[gnss] NAV-SAT: "));
+    SERIAL_USB->print(n); SERIAL_USB->print(F(" listed, "));
+    SERIAL_USB->print(with_signal); SERIAL_USB->print(F(" with signal, "));
+    SERIAL_USB->print(used); SERIAL_USB->print(F(" used in nav, max C/N0="));
+    SERIAL_USB->print(max_cno); SERIAL_USB->println(F(" dB-Hz"));
+    // list the usable ones (gnssId: 0=GPS 1=SBAS 2=Galileo 3=BeiDou 5=QZSS 6=GLONASS)
+    for (uint8_t i = 0; i < n; i++){
+      uint8_t cno = g.packetUBXNAVSAT->data.blocks[i].cno;
+      if (cno >= 15){
+        SERIAL_USB->print(F("    gnssId="));
+        SERIAL_USB->print(g.packetUBXNAVSAT->data.blocks[i].gnssId);
+        SERIAL_USB->print(F(" svId="));
+        SERIAL_USB->print(g.packetUBXNAVSAT->data.blocks[i].svId);
+        SERIAL_USB->print(F(" C/N0="));
+        SERIAL_USB->print(cno);
+        SERIAL_USB->print(F(" qual="));
+        SERIAL_USB->print(g.packetUBXNAVSAT->data.blocks[i].flags.bits.qualityInd);
+        SERIAL_USB->print(F(" used="));
+        SERIAL_USB->println(g.packetUBXNAVSAT->data.blocks[i].flags.bits.svUsed);
+      }
+    }
+  }
+  else{
+    SERIAL_USB->println(F("[gnss] NAV-SAT poll failed"));
+  }
+  SERIAL_USB->flush();
+  wdt.restart();
+}
+
 bool GNSS_Manager::get_a_fix(unsigned long timeout_seconds, bool set_RTC_time, bool perform_full_start, bool perform_full_stop){
   wdt.restart();
   good_fit = false;
@@ -83,11 +149,18 @@ bool GNSS_Manager::get_a_fix(unsigned long timeout_seconds, bool set_RTC_time, b
   SERIAL_USB->println();
   delay(10);
 
+  unsigned int status_tick {0};
   for (unsigned long start_millis=millis(); (gnss_fix_status != 3) && (millis() - start_millis < timeout_seconds * 1000UL); ){
     wdt.restart();
     SERIAL_USB->print(F("-"));
     delay(500);
     gnss_fix_status = gnss.getFixType();
+    // Every ~5 s, dump full receiver status so a no-fix situation (e.g. indoors
+    // / under a repeater) is diagnosable instead of just a row of dashes.
+    if (++status_tick % 10 == 0){
+      SERIAL_USB->println();
+      print_gnss_status(gnss);
+    }
   }
   SERIAL_USB->println();
 

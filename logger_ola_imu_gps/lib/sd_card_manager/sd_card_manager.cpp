@@ -290,6 +290,13 @@ void SD_Card_Manager::close_and_sync_file() {
     { SDIrqGuard _guard; sd_file.sync(); }
     wdt.restart();
 
+    // Shrink the file from its preallocated size down to the bytes actually
+    // written: the preallocation only matters for write performance WHILE
+    // logging; leaving the zero tail on closed files wasted ~4x the SD space
+    // (12 MiB files carrying ~3 MB of data).
+    { SDIrqGuard _guard; sd_file.truncate(sd_file.curPosition()); }
+    wdt.restart();
+
     { SDIrqGuard _guard; sd_file.close(); }
     file_open = false;
     SERIAL_USB->println(F("File closed"));

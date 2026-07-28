@@ -15,6 +15,31 @@ constexpr uint8_t CalibrationManager::MAX_PRESS_COUNT;
 CalibrationManager::BootAction
 CalibrationManager::detect_boot_action(int stat_led_pin, unsigned long window_ms)
 {
+    // Reset-cause gate. Only a reset from the external RESET pin may open or
+    // advance the multi-press sequence. Power-on / brown-out resets (battery
+    // contact bounce, USB plug-in) and watchdog reboots previously registered
+    // as phantom "presses": powering up commonly produces two boots in quick
+    // succession (power-on, then a CH340 DTR reset pulse when the host opens
+    // the serial port), which landed inside the decision window and triggered
+    // FILE TRANSFER mode without any button being touched.
+    //
+    // The RSTGEN status bits are sticky (they accumulate across resets), so
+    // read-then-clear every boot: the next boot then sees only its own cause.
+    am_hal_reset_status_t rst;
+    am_hal_reset_status_get(&rst);
+    am_hal_reset_control(AM_HAL_RESET_CONTROL_STATUSCLEAR, 0);
+    const bool button_reset = rst.bEXTStat && !rst.bPORStat && !rst.bBODStat;
+
+    if (!button_reset) {
+        // Power-up / brown-out / watchdog boot: never part of a press
+        // sequence. Clear any stale pending flag (e.g. power lost mid-window)
+        // and boot normally, WITHOUT the 2.5 s decision window — which also
+        // makes cold boots and watchdog recoveries faster.
+        EEPROM.put(ADDR_MULTIPRESS_FLAG, FLAG_IDLE);
+        EEPROM.put(ADDR_MULTIPRESS_COUNT, (uint8_t)0);
+        return BootAction::NORMAL;
+    }
+
     // Read the decision-pending flag and current press count from EEPROM.
     uint8_t flag = 0;
     uint8_t count = 0;

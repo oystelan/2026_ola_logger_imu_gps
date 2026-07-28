@@ -83,7 +83,12 @@ ICM_20948_SPI imu;
 
 static constexpr uint32_t seconds_in_15_minutes = 15 * 60;
 
-constexpr uint32_t PREALLOCATE_LOGFILE_SIZE_BYTES = 12 * 1024 * 1024; // Preallocate a file large enough for logging
+// 4 MiB: sized for the actual data rate — at 100 Hz accel+gyro (28 B/record)
+// + 10 Hz GNSS a 15-minute file carries ~3 MB, so 4 MiB leaves ~35% headroom.
+// (12 MiB was sized for the old 225 Hz + mag format and wasted ~4x the SD
+// space.) The file is truncated to its written size at close, so the
+// preallocation only affects write performance during logging, not storage.
+constexpr uint32_t PREALLOCATE_LOGFILE_SIZE_BYTES = 4 * 1024 * 1024;
 
 static constexpr char str_start_logging[] = "Log start OLA ICM-20948 logger\n\n";
 static constexpr char str_stop_logging[] = "\n\nLog stop OLA ICM-20948 logger\n";
@@ -542,11 +547,22 @@ void setup() {
 
   /////////////////////////////////////////////////////////////////////////////////
   // RESET-button multi-press detection. Runs EARLY so the decision window
-  // opens close to boot — the user presses RESET 2× for gyro cal, 3× for mag
-  // cal. Each press reboots the chip; consecutive presses are detected across
-  // reboots via a decision-pending flag in EEPROM. Blocks ~2.5 s (LED blinks).
-  CalibrationManager::BootAction boot_action =
-      calibration_manager.detect_boot_action(PIN_STAT_LED);
+  // opens close to boot — the user presses RESET 2× for file transfer, 3× for
+  // mag cal, 4× for gyro cal. Each press reboots the chip; consecutive presses
+  // are detected across reboots via a decision-pending flag in EEPROM. Blocks
+  // ~2.5 s (LED blinks).
+  //
+  // ENABLE_RESET_MULTIPRESS: master switch for the feature. When false, every
+  // boot is a NORMAL boot (no decision window, no 2.5 s wait) — RESET presses,
+  // USB DTR pulses, and power-glitch reboots can never divert the firmware
+  // into file-transfer/calibration modes. Set true to re-enable when a
+  // calibration or an over-USB file download is needed. (Note: the USB
+  // host-handshake file-transfer entry below stays available regardless.)
+  static constexpr bool ENABLE_RESET_MULTIPRESS = false;
+  CalibrationManager::BootAction boot_action = CalibrationManager::BootAction::NORMAL;
+  if (ENABLE_RESET_MULTIPRESS){
+    boot_action = calibration_manager.detect_boot_action(PIN_STAT_LED);
+  }
 
   /////////////////////////////////////////////////////////////////////////////////
   // Initialize serial over USB
@@ -811,6 +827,7 @@ void setup() {
           static constexpr unsigned long GNSS_FIX_WAIT_TIMEOUT_MS = 1000 * 60 * 2;
           unsigned long start_wait_ms = millis();
           SERIAL_USB->println(F("Waiting for GNSS fix..."));
+          unsigned int gnss_status_tick {0};
           while (millis() - start_wait_ms < GNSS_FIX_WAIT_TIMEOUT_MS){
             if (log_GNSS.getFixType() >= 3){
               fix_obtained = true;
@@ -820,6 +837,12 @@ void setup() {
             delay(500);
             wdt.restart();
             SERIAL_USB->print(F("."));
+            // Every ~5 s dump full receiver status (fix/sats/time/C-N0) so a
+            // no-fix situation (indoors / under a GPS repeater) is diagnosable.
+            if (++gnss_status_tick % 10 == 0){
+              SERIAL_USB->println();
+              print_gnss_status(log_GNSS);
+            }
           }
 
           if (!fix_obtained){

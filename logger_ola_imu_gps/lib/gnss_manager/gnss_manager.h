@@ -22,6 +22,14 @@ struct fix_information{
 void turn_gnss_on(void);
 void turn_gnss_off(void);
 
+// Dump GNSS receiver status to serial (fix type, sats-in-view, time validity,
+// dilution of precision, and per-satellite carrier-to-noise) for the given
+// GNSS instance. Useful for diagnosing no-fix / no-PPS situations (e.g. indoors
+// / under a GPS repeater): it shows whether any usable signal is reaching the
+// antenna and whether the receiver has resolved time yet. The module must
+// already be powered and begun.
+void print_gnss_status(SFE_UBLOX_GNSS &g);
+
 class GNSS_Manager{
   public:
   static constexpr unsigned long timeout_gnss_fix_seconds {5 * 60};

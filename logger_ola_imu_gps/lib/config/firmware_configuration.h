@@ -45,6 +45,8 @@ static constexpr int SD_CS_PIN {23};
 // reliably on slow cards but the actual SD writes (notably preAllocate) get
 // ~33% faster than at 24 MHz, which helps fit the per-file-rotation stall
 // inside the chip's 4 KB DMP-FIFO buffer (~1.86 s at 100 Hz).
+// (Tested 16 MHz for a card that failed to initialize — didn't help, so the
+// clock is not the issue for that card; kept at 32.)
 static constexpr int SD_SPI_MHZ {32};
 static constexpr int SD_PWR {15};
 
