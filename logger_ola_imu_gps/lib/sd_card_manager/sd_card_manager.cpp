@@ -324,18 +324,16 @@ bool SD_Card_Manager::write_buffer(const uint8_t* buffer, size_t size) {
     // silenced the IMU ISR for ~200 ms per RingBuf drain. That windowed
     // the gyro+mag flat-spots we kept seeing. Now the guard is just the
     // ~3 ms of actual SD write time.
-    if (ring_buf.bytesFree() < size + SD_RINGBUF_SIZE / 4) {
-        // Time to drain a chunk of the ring buffer to the card.
-        //
-        // We pick a SMALL chunk (4 KB = 8 SD sectors) so the SDIrqGuard
-        // window stays short and the per-flush gyro/mag freeze is bounded
-        // by how long ~8 sectors take on the worst-case SD card (~40 ms
-        // when the card is doing internal GC; ~5 ms when it's not). The
-        // total IMU data rate is unchanged, so we just flush more often
-        // with shorter freezes per flush — much friendlier to gyro/mag.
-        // Previous value (SD_RINGBUF_SIZE / 2 = 16 KB) produced ~150 ms
-        // freezes every ~1.6 s.
-        static constexpr size_t WRITEOUT_BYTES = 4096;
+    // Drain policy: KEEP THE RING NEARLY EMPTY. The previous trigger
+    // (drain only when < 25% free) deliberately let the ring sit ~75% full
+    // in steady state, leaving only ~8 KB of headroom to absorb an SD stall —
+    // which is how even 100 Hz recordings overflowed during long card-GC
+    // episodes. Now we drain a small chunk as soon as one is available:
+    // writes are more frequent but shorter (2 KB = 4 SD sectors, a few ms of
+    // SDIrqGuard each), and the ring's steady state is < 2 KB used — so
+    // nearly the FULL 32 KB (~ 9 s of data) is available as stall headroom.
+    static constexpr size_t WRITEOUT_BYTES = 2048;
+    if (ring_buf.bytesUsed() >= WRITEOUT_BYTES) {
         wdt.restart();
         {
             SDIrqGuard _guard;
@@ -345,7 +343,23 @@ bool SD_Card_Manager::write_buffer(const uint8_t* buffer, size_t size) {
     }
 
     // RAM-only copy — IMU ISR may run freely here.
-    size_t written = ring_buf.write(buffer, size);
+    //
+    // ATOMIC RECORD GUARD: RingBuf::write copies only as many bytes as fit.
+    // If the ring fills during a long SD stall, a PARTIAL record gets written
+    // and every subsequent byte in the file is misaligned — the decoder then
+    // sees junk bytes, byte-shifted frames (gravity on the wrong axis) and
+    // 0x4000-pattern garbage values until it resyncs. Never write a partial
+    // record: if the whole record does not fit, drop it and count it. A
+    // dropped record is a clean, decoder-friendly gap; a partial one poisons
+    // the rest of the file.
+    size_t written;
+    if (ring_buf.bytesFree() < size) {
+        dropped_records += 1;
+        dropped_bytes += size;
+        written = 0;
+    } else {
+        written = ring_buf.write(buffer, size);
+    }
     digitalWrite(PIN_STAT_LED, LOW);
 #else
     // Direct write to SD card file — needs the IRQ guard for the whole op.

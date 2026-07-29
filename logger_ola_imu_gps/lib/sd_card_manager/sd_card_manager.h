@@ -107,6 +107,14 @@ public:
      */
     FsFile* get_file() { return &sd_file; }
 
+    // Overflow accounting: records dropped WHOLE because the ring buffer was
+    // full (atomic-record guard in write_buffer — partial records are never
+    // written, they would byte-shift the rest of the file). Reported in the
+    // periodic logging stats; reset them there if per-interval counts are
+    // wanted.
+    uint32_t dropped_records {0};
+    uint32_t dropped_bytes {0};
+
 private:
     SdFat sd_card;              ///< SD card filesystem object
     FsFile sd_file;             ///< Currently open file object

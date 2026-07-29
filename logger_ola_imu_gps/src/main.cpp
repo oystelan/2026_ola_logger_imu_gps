@@ -54,6 +54,10 @@ static constexpr bool ENABLE_BOOT_COUNTER = true;          ///< Enable boot coun
 static constexpr bool ENABLE_GNSS = true;                    ///< Master switch for GNSS module (begin, ISR read, PPS, deque write)
 static constexpr bool ENABLE_GNSS_START = true;              ///< If true AND a GNSS module is detected at boot, wait for a valid fix before starting sampling
 static constexpr bool ENABLE_DEBUG_FASTPRINT = false;
+// Stream every logged IMU sample (acc mg + gyro dps) as an "IMUS ..." line on
+// USB serial while sampling. Debug/inspection builds only — keep false for
+// deployment units (it is harmless to logging but chatty: ~6 kB/s).
+static constexpr bool ENABLE_SERIAL_IMU_STREAM = false;
 
 // --- Runtime state populated during boot ---
 // True iff log_GNSS.begin() succeeded at boot. Drives whether we wait for a
@@ -162,6 +166,13 @@ etl::deque<IMU_reading, SIZE_DEQUE_IMU> deque_IMU_readings;
 volatile uint32_t ctimer_isr_count {0};
 volatile uint16_t imu_isr_count {0};
 
+// Chip-FIFO overflow events (FIFO count pinned near 4 kB => wrapped, dumped).
+// Reported in the periodic stats so overruns are visible instead of silent.
+volatile uint32_t g_fifo_overflow_count {0};
+// FIFO capacity is 4096 B; a count within one max DMP packet (22 B) of the
+// top means we can no longer prove the oldest bytes weren't overwritten.
+static constexpr uint16_t FIFO_OVERFLOW_THRESHOLD_BYTES = 4096 - 22;
+
 // Gyro bias (body frame, int16 LSB) subtracted in the ISR before logging.
 // Populated from EEPROM via calibration_manager at boot; 0 if uncalibrated.
 volatile int16_t g_gyro_bias_x {0};
@@ -269,6 +280,19 @@ extern "C" void am_ctimer_isr(void)
         uint16_t fifo_avail = 0;
         imu.getFIFOcount(&fifo_avail);
         if (fifo_avail < DMP_MAX_PACKET_BYTES) break;
+
+        // OVERFLOW FLAG: the hardware FIFO is 4 kB. If the count is pinned
+        // near the top, the FIFO has (almost certainly) wrapped and the
+        // oldest packets were overwritten mid-frame — draining now would
+        // yield byte-misaligned garbage (the 0x4000-pattern glitches seen in
+        // the noise tests). Dump it, resync, and count the event so the
+        // periodic stats report overflow occurrences explicitly.
+        if (fifo_avail >= FIFO_OVERFLOW_THRESHOLD_BYTES){
+          imu.resetFIFO();
+          skip_packets_after_reset = POST_RESET_DISCARD_PACKETS;
+          g_fifo_overflow_count++;
+          break;
+        }
 
         icm_20948_DMP_data_t pkt;
         imu.readDMPdataFromFIFO(&pkt);
@@ -1671,6 +1695,16 @@ void setup() {
         SERIAL_USB->print(time_between_stats_millis);
         SERIAL_USB->println(F(" ms interval"));
 
+        // Overflow accounting (cumulative since boot). Non-zero numbers mean
+        // data was LOST — cleanly (whole records / whole FIFO dumps), never as
+        // corrupt partial frames — and warrant looking at SD card health.
+        SERIAL_USB->print(F("Overflow counters: ring-dropped records: "));
+        SERIAL_USB->print(sd_card_manager.dropped_records);
+        SERIAL_USB->print(F(" ("));
+        SERIAL_USB->print(sd_card_manager.dropped_bytes);
+        SERIAL_USB->print(F(" B); chip-FIFO overflows: "));
+        SERIAL_USB->println(g_fifo_overflow_count);
+
         // Frequency-checker auto-reset removed: a momentary dip in IMU/GNSS/PPS
         // rate (e.g. from SD-write blocking) used to trigger NVIC_SystemReset,
         // which silently rebooted the MCU mid-recording and corrupted the
@@ -1760,6 +1794,30 @@ void setup() {
         sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(entry_kind), sizeof(entry_kind));
         sd_card_manager.write_buffer(reinterpret_cast<const uint8_t*>(&local_imu_reading), sizeof(local_imu_reading));
         accumulated_sd_time_millis += (millis() - working_millis);
+
+        // Live IMU stream over USB serial (debug/inspection builds). Prints
+        // every logged sample as converted engineering units:
+        //   IMUS <micros> <acc_x> <acc_y> <acc_z> <gyr_x> <gyr_y> <gyr_z>
+        // with accel in mg (0.061035 mg/LSB at gpm2) and gyro in dps
+        // (7.633588 mdps/LSB at dps250). ~60 B/line x 100 Hz = 6 kB/s, well
+        // under the 1 Mbaud (~100 kB/s) USB link, so logging is unaffected.
+        if (ENABLE_SERIAL_IMU_STREAM){
+          SERIAL_USB->print(F("IMUS "));
+          SERIAL_USB->print(local_imu_reading.micros_reading);
+          SERIAL_USB->print(' ');
+          SERIAL_USB->print(local_imu_reading.acc_x * 0.061035f, 1);
+          SERIAL_USB->print(' ');
+          SERIAL_USB->print(local_imu_reading.acc_y * 0.061035f, 1);
+          SERIAL_USB->print(' ');
+          SERIAL_USB->print(local_imu_reading.acc_z * 0.061035f, 1);
+          SERIAL_USB->print(' ');
+          SERIAL_USB->print(local_imu_reading.gyr_x * 0.007633588f, 2);
+          SERIAL_USB->print(' ');
+          SERIAL_USB->print(local_imu_reading.gyr_y * 0.007633588f, 2);
+          SERIAL_USB->print(' ');
+          SERIAL_USB->println(local_imu_reading.gyr_z * 0.007633588f, 2);
+        }
+
         should_log_data = false;
       }
 
